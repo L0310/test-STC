@@ -1,28 +1,614 @@
 import argparse
 import os
+import sys
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from types import MethodType
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 from skimage.segmentation import slic
 
-from depth_discontinuity_demo import (
-    PALETTE,
-    _build_stem_index,
-    _build_support_mask,
-    _compute_depth_discontinuity,
-    _connected_components,
-    _draw_boundaries,
-    _iter_depth_paths,
-    _labels_to_rgb,
-    _normalize_gray,
-    _preprocess_depth,
-    _read_rgb_image,
-    _restore_mask_coverage,
-    _to_uint8,
-)
-from dinov2_feature_viz import _OnTheFlyDINOExtractor, _default_dino_repo
+
+DEPTH_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+PALETTE = [
+    (255, 99, 71),
+    (255, 215, 0),
+    (0, 191, 255),
+    (50, 205, 50),
+    (255, 105, 180),
+    (138, 43, 226),
+    (255, 140, 0),
+    (64, 224, 208),
+]
+
+
+def _candidate_local_dino_repos() -> List[Path]:
+    project_root = Path(__file__).resolve().parent.parent
+    home = Path.home()
+    torch_home = Path(os.environ.get("TORCH_HOME", "")).expanduser() if os.environ.get("TORCH_HOME") else None
+    xdg_cache_home = Path(os.environ.get("XDG_CACHE_HOME", "")).expanduser() if os.environ.get("XDG_CACHE_HOME") else None
+    candidates = [
+        project_root / "dinov2",
+        project_root / "facebookresearch_dinov2_main",
+        project_root / "Depth-Anything-V2-main",
+        project_root / ".." / "dinov2",
+        project_root / ".." / "facebookresearch_dinov2_main",
+        home / ".cache" / "torch" / "hub" / "facebookresearch_dinov2_main",
+    ]
+    if torch_home is not None:
+        candidates.append(torch_home / "hub" / "facebookresearch_dinov2_main")
+    if xdg_cache_home is not None:
+        candidates.append(xdg_cache_home / "torch" / "hub" / "facebookresearch_dinov2_main")
+
+    unique: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if str(candidate) in seen:
+            continue
+        seen.add(str(candidate))
+        if (candidate / "hubconf.py").exists():
+            unique.append(candidate)
+
+    hub_search_roots = [home / ".cache" / "torch" / "hub"]
+    if torch_home is not None:
+        hub_search_roots.append(torch_home / "hub")
+    if xdg_cache_home is not None:
+        hub_search_roots.append(xdg_cache_home / "torch" / "hub")
+    for root in hub_search_roots:
+        if not root.exists():
+            continue
+        for candidate in sorted(root.glob("*dinov2*")):
+            candidate = candidate.resolve()
+            if str(candidate) in seen:
+                continue
+            seen.add(str(candidate))
+            if (candidate / "hubconf.py").exists():
+                unique.append(candidate)
+    return unique
+
+
+def _default_dino_repo() -> str:
+    repos = _candidate_local_dino_repos()
+    return str(repos[0]) if repos else ""
+
+
+def _suppress_optional_dino_warnings() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*xFormers is not available.*",
+        category=UserWarning,
+    )
+
+
+@contextmanager
+def _temporarily_hide_xformers_imports():
+    sentinel_names = ["xformers", "xformers.ops", "xformers._C"]
+    saved: Dict[str, object] = {}
+    try:
+        for name in sentinel_names:
+            if name in sys.modules:
+                saved[name] = sys.modules[name]
+            sys.modules[name] = None
+        yield
+    finally:
+        for name in sentinel_names:
+            if name in saved:
+                sys.modules[name] = saved[name]
+            else:
+                sys.modules.pop(name, None)
+
+
+def _is_xformers_runtime_error(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    return (
+        "memory_efficient_attention" in lowered
+        or ("no operator found" in lowered and "xformers" in lowered)
+        or "xformers wasn't built with cuda support" in lowered
+    )
+
+
+def _normalize_gray(image: np.ndarray) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    if image.ndim == 3:
+        image = image[..., 0]
+    min_value = float(image.min()) if image.size > 0 else 0.0
+    max_value = float(image.max()) if image.size > 0 else 0.0
+    if max_value - min_value <= 1e-6:
+        return np.zeros_like(image, dtype=np.float32)
+    return ((image - min_value) / (max_value - min_value)).astype(np.float32)
+
+
+def _to_uint8(image: np.ndarray) -> np.ndarray:
+    return np.clip(np.round(_normalize_gray(image) * 255.0), 0.0, 255.0).astype(np.uint8)
+
+
+def _resize_feature_map(feature_map: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+    feature_map = np.asarray(feature_map, dtype=np.float32)
+    target_h, target_w = int(target_shape[0]), int(target_shape[1])
+    if feature_map.ndim == 2:
+        feature_map = feature_map[..., None]
+    if feature_map.shape[:2] == (target_h, target_w):
+        return feature_map.astype(np.float32)
+    resized_channels = [
+        cv2.resize(feature_map[..., channel_idx], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        for channel_idx in range(feature_map.shape[2])
+    ]
+    return np.stack(resized_channels, axis=2).astype(np.float32)
+
+
+def _prepare_feature_map(feature_map: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+    feature_map = np.asarray(feature_map, dtype=np.float32)
+    if feature_map.ndim == 2:
+        feature_map = feature_map[..., None]
+    elif feature_map.ndim == 3:
+        if feature_map.shape[0] <= 32 and feature_map.shape[1] > 32 and feature_map.shape[2] > 32:
+            feature_map = np.transpose(feature_map, (1, 2, 0))
+    else:
+        raise ValueError(f"Unsupported feature-map shape: {feature_map.shape}")
+    feature_map = _resize_feature_map(feature_map, target_shape)
+    feature_map = np.nan_to_num(feature_map, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    denom = np.linalg.norm(feature_map, axis=2, keepdims=True)
+    return feature_map / np.maximum(denom, 1e-6)
+
+
+class _OnTheFlyDINOExtractor:
+    def __init__(
+        self,
+        weight_path: Optional[Path],
+        model_name: str,
+        repo_path: str,
+        device: str,
+        max_side: int,
+    ) -> None:
+        try:
+            import torch
+        except Exception as exc:
+            raise RuntimeError(f"PyTorch is required for DINO feature extraction: {exc}")
+        self.torch = torch
+        self.weight_path = Path(weight_path) if weight_path else None
+        self.model_name = str(model_name)
+        self.repo_path = str(repo_path).strip() or _default_dino_repo()
+        self.device = self._resolve_device(device)
+        self.max_side = max(0, int(max_side))
+        self._xformers_forced_off = False
+        self.model = self._load_model()
+        self.model.eval().to(self.device)
+        self.patch_size = self._infer_patch_size(self.model)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+
+    def _resolve_device(self, device: str):
+        device = str(device).strip().lower()
+        if device in {"", "auto"}:
+            return self.torch.device("cuda" if self.torch.cuda.is_available() else "cpu")
+        return self.torch.device(device)
+
+    def _load_model(self):
+        source = "local" if self.repo_path else "github"
+        repo = self.repo_path if self.repo_path else "facebookresearch/dinov2"
+        try:
+            with warnings.catch_warnings(), _temporarily_hide_xformers_imports():
+                _suppress_optional_dino_warnings()
+                model = self.torch.hub.load(repo, self.model_name, source=source, pretrained=False)
+        except Exception as exc:
+            if source == "github":
+                local_repo_hint = _default_dino_repo()
+                hint_suffix = (
+                    f" Detected local fallback candidate: {local_repo_hint}. Try --dino-repo {local_repo_hint}"
+                    if local_repo_hint
+                    else ""
+                )
+                raise RuntimeError(
+                    "Failed to build DINO model from GitHub. Provide --dino-repo pointing to a local repo clone, "
+                    f"or make sure the environment can reach github.{hint_suffix} Details: {exc}"
+                )
+            raise RuntimeError(f"Failed to build DINO model from local repo {repo}: {exc}")
+
+        if self.weight_path is not None:
+            if not self.weight_path.exists():
+                raise FileNotFoundError(f"DINO weight file not found: {self.weight_path}")
+            payload = self.torch.load(str(self.weight_path), map_location="cpu")
+            state_dict = self._extract_state_dict(payload)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"Warn: missing keys when loading DINO weights ({len(missing)} keys).")
+            if unexpected:
+                print(f"Warn: unexpected keys when loading DINO weights ({len(unexpected)} keys).")
+        self._force_disable_xformers_runtime(model=model)
+        return model
+
+    def _extract_state_dict(self, payload: object) -> Dict[str, object]:
+        if isinstance(payload, dict):
+            for key in ["state_dict", "model", "teacher", "student", "network", "backbone"]:
+                value = payload.get(key)
+                if isinstance(value, dict) and value:
+                    payload = value
+                    break
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unsupported checkpoint format for DINO weights.")
+        cleaned: Dict[str, object] = {}
+        for raw_key, value in payload.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key
+            for prefix in ["module.", "model.", "backbone.", "teacher.", "student.", "encoder."]:
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+            cleaned[key] = value
+        return cleaned
+
+    def _infer_patch_size(self, model) -> int:
+        value = getattr(model, "patch_size", None)
+        if isinstance(value, int) and value > 0:
+            return int(value)
+        if isinstance(value, tuple) and len(value) > 0 and int(value[0]) > 0:
+            return int(value[0])
+        patch_embed = getattr(model, "patch_embed", None)
+        if patch_embed is not None:
+            value = getattr(patch_embed, "patch_size", None)
+            if isinstance(value, int) and value > 0:
+                return int(value)
+            if isinstance(value, tuple) and len(value) > 0 and int(value[0]) > 0:
+                return int(value[0])
+        return 14
+
+    def _rounded_multiple(self, value: int, divisor: int) -> int:
+        value = max(1, int(value))
+        divisor = max(1, int(divisor))
+        return max(divisor, int(round(float(value) / float(divisor))) * divisor)
+
+    def _compute_scaled_shape(self, height: int, width: int) -> Tuple[int, int]:
+        scale = min(1.0, float(self.max_side) / float(max(height, width))) if self.max_side > 0 else 1.0
+        scaled_h = self._rounded_multiple(int(round(height * scale)), self.patch_size)
+        scaled_w = self._rounded_multiple(int(round(width * scale)), self.patch_size)
+        return scaled_h, scaled_w
+
+    def get_batch_key(self, rgb_shape: Tuple[int, int]) -> Tuple[int, int]:
+        return self._compute_scaled_shape(int(rgb_shape[0]), int(rgb_shape[1]))
+
+    def _prepare_sample_tensor(self, rgb: np.ndarray):
+        rgb = np.asarray(rgb, dtype=np.uint8)
+        height, width = rgb.shape[:2]
+        scaled_h, scaled_w = self._compute_scaled_shape(height, width)
+        rgb_resized = cv2.resize(rgb, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+        tensor = self.torch.from_numpy(rgb_resized.astype(np.float32) / 255.0).permute(2, 0, 1)
+        tensor = tensor.to(self.device)
+        tensor = (tensor - self.mean[0]) / self.std[0]
+        return tensor, (scaled_h, scaled_w)
+
+    def _extract_tokens(self, outputs, grid_h: int, grid_w: int):
+        torch = self.torch
+        if isinstance(outputs, dict):
+            for key in ["x_norm_patchtokens", "patch_tokens", "x_patchtokens", "patchtokens"]:
+                value = outputs.get(key)
+                if torch.is_tensor(value):
+                    outputs = value
+                    break
+        if torch.is_tensor(outputs):
+            if outputs.ndim == 4:
+                return outputs
+            if outputs.ndim == 3:
+                if outputs.shape[1] == 1 + grid_h * grid_w:
+                    outputs = outputs[:, 1:, :]
+                if outputs.shape[1] == grid_h * grid_w:
+                    return outputs.reshape(outputs.shape[0], grid_h, grid_w, outputs.shape[2]).permute(0, 3, 1, 2)
+        if isinstance(outputs, (list, tuple)) and outputs:
+            for value in outputs:
+                tokens = self._extract_tokens(value, grid_h=grid_h, grid_w=grid_w)
+                if tokens is not None:
+                    return tokens
+        return None
+
+    def _force_disable_xformers_runtime(self, model=None) -> None:
+        if self._xformers_forced_off:
+            return
+
+        torch = self.torch
+        target_model = model if model is not None else getattr(self, "model", None)
+        if target_model is None:
+            return
+        for module_name, module in list(sys.modules.items()):
+            if module is None:
+                continue
+            file_path = str(getattr(module, "__file__", "") or "").replace("\\", "/")
+            is_dino_attention = module_name.endswith("dinov2.layers.attention") or file_path.endswith("/dinov2/layers/attention.py")
+            is_dino_block = module_name.endswith("dinov2.layers.block") or file_path.endswith("/dinov2/layers/block.py")
+            is_dino_swiglu = module_name.endswith("dinov2.layers.swiglu_ffn") or file_path.endswith("/dinov2/layers/swiglu_ffn.py")
+            if not (is_dino_attention or is_dino_block or is_dino_swiglu):
+                continue
+            if hasattr(module, "XFORMERS_AVAILABLE"):
+                setattr(module, "XFORMERS_AVAILABLE", False)
+            if is_dino_attention and hasattr(module, "memory_efficient_attention"):
+                setattr(module, "memory_efficient_attention", None)
+
+        def _fallback_mem_eff_attention(this, x, attn_bias=None):
+            def _apply_dropout(value, dropout_obj):
+                if callable(dropout_obj):
+                    return dropout_obj(value)
+                drop_prob = float(dropout_obj) if dropout_obj is not None else 0.0
+                if drop_prob <= 0.0:
+                    return value
+                return torch.nn.functional.dropout(value, p=drop_prob, training=bool(this.training))
+
+            batch, num_tokens, dim = x.shape
+            qkv = this.qkv(x).reshape(batch, num_tokens, 3, this.num_heads, dim // this.num_heads).permute(2, 0, 3, 1, 4)
+            q = qkv[0] * this.scale
+            k = qkv[1]
+            v = qkv[2]
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = _apply_dropout(attn, getattr(this, "attn_drop", 0.0))
+            x = (attn @ v).transpose(1, 2).reshape(batch, num_tokens, dim)
+            x = this.proj(x)
+            x = _apply_dropout(x, getattr(this, "proj_drop", 0.0))
+            return x
+
+        def _fallback_swiglu(this, x):
+            x12 = this.w12(x)
+            x1, x2 = x12.chunk(2, dim=-1)
+            x = torch.nn.functional.silu(x1) * x2
+            return this.w3(x)
+
+        for module in target_model.modules():
+            class_name = module.__class__.__name__
+            if class_name == "MemEffAttention" and not getattr(module, "_codex_xformers_patched", False):
+                module.forward = MethodType(_fallback_mem_eff_attention, module)
+                module._codex_xformers_patched = True
+            elif (
+                "SwiGLU" in class_name
+                and hasattr(module, "w12")
+                and hasattr(module, "w3")
+                and not getattr(module, "_codex_xformers_patched", False)
+            ):
+                module.forward = MethodType(_fallback_swiglu, module)
+                module._codex_xformers_patched = True
+
+        self._xformers_forced_off = True
+
+    def extract(self, rgb: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        if rgb is None:
+            raise RuntimeError("RGB image is required for DINO feature extraction.")
+        try:
+            return self._extract_impl_batch([rgb], [target_shape])[0]
+        except Exception as exc:
+            if not _is_xformers_runtime_error(exc):
+                raise
+            print("Warn: incompatible xFormers runtime detected; retrying with PyTorch attention fallback.")
+            self._force_disable_xformers_runtime()
+            return self._extract_impl_batch([rgb], [target_shape])[0]
+
+    def extract_batch(self, rgbs: Sequence[np.ndarray], target_shapes: Sequence[Tuple[int, int]]) -> List[np.ndarray]:
+        if len(rgbs) != len(target_shapes):
+            raise ValueError("rgbs and target_shapes must have the same length.")
+        if not rgbs:
+            return []
+        try:
+            return self._extract_impl_batch(rgbs, target_shapes)
+        except Exception as exc:
+            if not _is_xformers_runtime_error(exc):
+                raise
+            print("Warn: incompatible xFormers runtime detected during batched extraction; retrying with PyTorch attention fallback.")
+            self._force_disable_xformers_runtime()
+            return self._extract_impl_batch(rgbs, target_shapes)
+
+    def _extract_impl_batch(self, rgbs: Sequence[np.ndarray], target_shapes: Sequence[Tuple[int, int]]) -> List[np.ndarray]:
+        prepared_tensors: List[object] = []
+        scaled_shape: Optional[Tuple[int, int]] = None
+        for rgb in rgbs:
+            x, current_scaled_shape = self._prepare_sample_tensor(rgb)
+            if scaled_shape is None:
+                scaled_shape = current_scaled_shape
+            elif current_scaled_shape != scaled_shape:
+                raise ValueError("All images in one batch must share the same prepared shape.")
+            prepared_tensors.append(x)
+        if scaled_shape is None:
+            return []
+        x = self.torch.stack(prepared_tensors, dim=0)
+        scaled_h, scaled_w = scaled_shape
+        grid_h = max(1, scaled_h // self.patch_size)
+        grid_w = max(1, scaled_w // self.patch_size)
+        with self.torch.no_grad():
+            tokens = None
+            if hasattr(self.model, "forward_features"):
+                try:
+                    outputs = self.model.forward_features(x)
+                    tokens = self._extract_tokens(outputs, grid_h=grid_h, grid_w=grid_w)
+                except Exception:
+                    tokens = None
+            if tokens is None and hasattr(self.model, "get_intermediate_layers"):
+                outputs = self.model.get_intermediate_layers(x, n=1, reshape=False)
+                tokens = self._extract_tokens(outputs, grid_h=grid_h, grid_w=grid_w)
+            if tokens is None:
+                outputs = self.model(x)
+                tokens = self._extract_tokens(outputs, grid_h=grid_h, grid_w=grid_w)
+            if tokens is None:
+                raise RuntimeError("Unable to parse patch tokens from the DINO model output.")
+            tokens = tokens.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.float32)
+        return [_prepare_feature_map(tokens[idx], target_shape=target_shapes[idx]) for idx in range(len(target_shapes))]
+
+
+def _ensure_odd(value: int) -> int:
+    value = max(1, int(value))
+    return value if value % 2 == 1 else value + 1
+
+
+def _filter_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    mask = (np.asarray(mask) > 0).astype(np.uint8)
+    if int(mask.sum()) <= 0:
+        return mask
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    filtered = np.zeros_like(mask, dtype=np.uint8)
+    for label_idx in range(1, num_labels):
+        if int(stats[label_idx, cv2.CC_STAT_AREA]) >= int(min_area):
+            filtered[labels == label_idx] = 1
+    return filtered
+
+
+def _connected_components(mask: np.ndarray) -> List[np.ndarray]:
+    mask = (np.asarray(mask) > 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    components: List[Tuple[int, np.ndarray]] = []
+    for label_idx in range(1, num_labels):
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        component = (labels == label_idx).astype(np.uint8)
+        components.append((area, component))
+    components.sort(key=lambda item: item[0], reverse=True)
+    return [component for _, component in components]
+
+
+def _iter_depth_paths(root: Path) -> Iterable[Path]:
+    if root.is_file():
+        yield root
+        return
+    for current_root, _, file_names in os.walk(root):
+        for file_name in sorted(file_names):
+            if Path(file_name).suffix.lower() in DEPTH_EXTENSIONS:
+                yield Path(current_root) / file_name
+
+
+def _build_stem_index(root: Path) -> Dict[str, Path]:
+    index: Dict[str, Path] = {}
+    for current_root, _, file_names in os.walk(root):
+        for file_name in sorted(file_names):
+            if Path(file_name).suffix.lower() not in DEPTH_EXTENSIONS:
+                continue
+            stem = Path(file_name).stem
+            if stem not in index:
+                index[stem] = Path(current_root) / file_name
+    return index
+
+
+def _read_rgb_image(path: Path) -> Optional[np.ndarray]:
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def _mask_mean_depth(mask: np.ndarray, depth: np.ndarray) -> float:
+    values = np.asarray(depth, dtype=np.float32)[np.asarray(mask) > 0]
+    if values.size == 0:
+        return 0.0
+    return float(values.mean())
+
+
+def _mask_centroid(mask: np.ndarray) -> np.ndarray:
+    ys, xs = np.where(np.asarray(mask) > 0)
+    if len(xs) == 0:
+        return np.zeros(2, dtype=np.float32)
+    return np.array([float(xs.mean()), float(ys.mean())], dtype=np.float32)
+
+
+def _merge_masks(mask_a: np.ndarray, mask_b: np.ndarray) -> np.ndarray:
+    return np.maximum((np.asarray(mask_a) > 0).astype(np.uint8), (np.asarray(mask_b) > 0).astype(np.uint8))
+
+
+def _select_best_target(fragment_mask: np.ndarray, target_masks: Sequence[np.ndarray], depth_map: np.ndarray) -> int:
+    if not target_masks:
+        return -1
+    fragment_center = _mask_centroid(fragment_mask)
+    fragment_depth = _mask_mean_depth(fragment_mask, depth_map)
+    diag = float(np.hypot(fragment_mask.shape[0], fragment_mask.shape[1]))
+    best_idx = -1
+    best_score = None
+    for target_idx, target_mask in enumerate(target_masks):
+        target_center = _mask_centroid(target_mask)
+        target_depth = _mask_mean_depth(target_mask, depth_map)
+        spatial_dist = float(np.linalg.norm(fragment_center - target_center)) / max(diag, 1.0)
+        depth_gap = abs(fragment_depth - target_depth)
+        score = depth_gap + 0.2 * spatial_dist
+        if best_score is None or score < best_score:
+            best_score = score
+            best_idx = target_idx
+    return best_idx
+
+
+def _restore_mask_coverage(reference_mask: np.ndarray, region_masks: List[np.ndarray], depth_map: np.ndarray) -> List[np.ndarray]:
+    reference_mask = (np.asarray(reference_mask) > 0).astype(np.uint8)
+    if not region_masks:
+        return [reference_mask] if int(reference_mask.sum()) > 0 else []
+
+    union = np.zeros_like(reference_mask, dtype=np.uint8)
+    valid_regions: List[np.ndarray] = []
+    for region in region_masks:
+        region = (np.asarray(region) > 0).astype(np.uint8)
+        if int(region.sum()) <= 0:
+            continue
+        valid_regions.append(region)
+        union = np.maximum(union, region)
+    if not valid_regions:
+        return [reference_mask] if int(reference_mask.sum()) > 0 else []
+
+    leftover = ((reference_mask > 0) & (union == 0)).astype(np.uint8)
+    if int(leftover.sum()) <= 0:
+        return valid_regions
+
+    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(leftover, connectivity=8)
+    for label_idx in range(1, num_labels):
+        fragment = (labels == label_idx).astype(np.uint8)
+        target_idx = _select_best_target(fragment, valid_regions, depth_map)
+        if target_idx >= 0:
+            valid_regions[target_idx] = _merge_masks(valid_regions[target_idx], fragment)
+    return valid_regions
+
+
+def _build_support_mask(depth: np.ndarray, gt_mask: np.ndarray, min_area: int) -> np.ndarray:
+    gt_mask = (np.asarray(gt_mask) > 0).astype(np.uint8)
+    if int(gt_mask.sum()) <= 0:
+        return np.zeros_like(gt_mask, dtype=np.uint8)
+    depth_valid = np.isfinite(np.asarray(depth, dtype=np.float32)).astype(np.uint8)
+    support = ((gt_mask > 0) & (depth_valid > 0)).astype(np.uint8)
+    return _filter_components(support, min_area=min_area)
+
+
+def _preprocess_depth(
+    depth: np.ndarray,
+    median_ksize: int,
+    bilateral_d: int,
+    bilateral_sigma_color: float,
+    bilateral_sigma_space: float,
+) -> np.ndarray:
+    depth = _normalize_gray(depth)
+    median_ksize = _ensure_odd(median_ksize)
+    if median_ksize > 1:
+        depth = cv2.medianBlur(depth.astype(np.float32), median_ksize)
+    if int(bilateral_d) > 1:
+        depth = cv2.bilateralFilter(
+            depth.astype(np.float32),
+            d=int(bilateral_d),
+            sigmaColor=float(bilateral_sigma_color),
+            sigmaSpace=float(bilateral_sigma_space),
+        )
+    return _normalize_gray(depth)
+
+
+def _compute_depth_discontinuity(depth: np.ndarray) -> np.ndarray:
+    depth = _normalize_gray(depth)
+    grad_x = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
+    return _normalize_gray(cv2.magnitude(grad_x, grad_y))
+
+
+def _labels_to_rgb(label_map: np.ndarray) -> np.ndarray:
+    label_map = np.asarray(label_map, dtype=np.int32)
+    label_rgb = np.zeros((label_map.shape[0], label_map.shape[1], 3), dtype=np.uint8)
+    for label_idx in sorted(int(v) for v in np.unique(label_map) if int(v) > 0):
+        label_rgb[label_map == label_idx] = np.array(PALETTE[(label_idx - 1) % len(PALETTE)], dtype=np.uint8)
+    return label_rgb
+
+
+def _draw_boundaries(base_gray: np.ndarray, label_map: np.ndarray) -> np.ndarray:
+    canvas = cv2.cvtColor(_to_uint8(base_gray), cv2.COLOR_GRAY2BGR)
+    for label_idx in sorted(int(v) for v in np.unique(label_map) if int(v) > 0):
+        mask = (label_map == label_idx).astype(np.uint8)
+        color = PALETTE[(label_idx - 1) % len(PALETTE)]
+        eroded = cv2.erode(mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        canvas[(mask > 0) & (eroded == 0)] = np.array(color, dtype=np.uint8)
+    return canvas
 
 
 def _lab_image(rgb: Optional[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:

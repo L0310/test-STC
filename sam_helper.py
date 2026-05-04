@@ -13,9 +13,9 @@ import torch
 SEGMENT_ANYTHING_ROOT = os.path.join(os.path.dirname(__file__), "segment-anything-main")
 if os.path.isdir(SEGMENT_ANYTHING_ROOT) and SEGMENT_ANYTHING_ROOT not in sys.path:
     sys.path.insert(0, SEGMENT_ANYTHING_ROOT)
-REFER_ROOT = os.path.join(os.path.dirname(__file__), "A2S-v2-main", "refer")
-if os.path.isdir(REFER_ROOT) and REFER_ROOT not in sys.path:
-    sys.path.insert(0, REFER_ROOT)
+A2S_ROOT = os.path.join(os.path.dirname(__file__), "A2S-v2-main")
+if os.path.isdir(A2S_ROOT) and A2S_ROOT not in sys.path:
+    sys.path.insert(0, A2S_ROOT)
 
 from segment_anything import SamPredictor, sam_model_registry
 from tools.ai.demo_utils import crf_inference_label
@@ -867,7 +867,7 @@ class SAMTrainHelper:
             print("Warn: DINO semantic affinity checkpoint not found: {}. Using depth/RGB affinity only.".format(self.dino_weight))
             return None
         try:
-            from dinov2_feature_viz import _OnTheFlyDINOExtractor, _default_dino_repo
+            from depth_affinity_spectral_demo import _OnTheFlyDINOExtractor, _default_dino_repo
 
             self._dino_extractor = _OnTheFlyDINOExtractor(
                 weight_path=Path(self.dino_weight),
@@ -1408,10 +1408,28 @@ class SAMTrainHelper:
             candidate.filter_bg_iou = _compute_iou(mask_orig, bg_mask)
             candidates_by_point.setdefault(candidate.point_idx, []).append(candidate)
 
+        positive_group_starts = sorted(point_idx for point_idx in candidates_by_point.keys() if point_idx >= 0)
+
+        def _prompt_group_bounds(point_idx: int) -> Tuple[int, int]:
+            if point_idx < 0 or point_idx >= len(points_xy):
+                return point_idx, point_idx
+            next_starts = [start for start in positive_group_starts if start > point_idx]
+            group_end = next_starts[0] if next_starts else len(points_xy)
+            group_end = max(point_idx + 1, min(group_end, len(points_xy)))
+            return point_idx, group_end
+
+        def _prompt_group_tag(point_idx: int) -> str:
+            if point_idx < 0:
+                return "box"
+            group_start, group_end = _prompt_group_bounds(point_idx)
+            if group_end <= group_start + 1:
+                return f"p{point_idx + 1}"
+            return f"p{group_start + 1}-p{group_end}"
+
         for output_prefix in output_prefixes:
             out_dir = self._make_out_dir(output_prefix, epoch)
             for point_idx, cand_list in candidates_by_point.items():
-                prompt_tag = "box" if point_idx < 0 else f"{point_idx + 1}"
+                prompt_tag = _prompt_group_tag(point_idx)
                 point_dir = os.path.join(out_dir, f"{stem}_{prompt_tag}")
                 os.makedirs(point_dir, exist_ok=True)
 
@@ -1421,12 +1439,13 @@ class SAMTrainHelper:
                     if point_idx < 0 and box_xyxy is not None:
                         overlay = SAMHelper.draw_box(overlay, box_xyxy)
                     elif point_idx < len(points_xy):
+                        group_start, group_end = _prompt_group_bounds(point_idx)
                         overlay = SAMHelper.draw_points(
                             overlay,
-                            np.array([points_xy[point_idx]], dtype=np.float32),
+                            points_xy[group_start:group_end].astype(np.float32),
                         )
                     save_name = (
-                        f"{stem}_{'box' if point_idx < 0 else f'p{point_idx + 1}'}_c{cand_idx}"
+                        f"{stem}_{prompt_tag}_c{cand_idx}"
                         f"_samiou{candidate.score:.2f}"
                         f"_fg_iou{candidate.fg_iou:.2f}"
                         f"_heat_iou{candidate.heat_iou:.2f}"
