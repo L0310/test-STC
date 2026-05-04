@@ -60,8 +60,44 @@ def resolve_sam_dino_weight(config):
     return default_weight if os.path.exists(default_weight) else ''
 
 
+def resolve_sam_prompt_mode(config):
+    if config.get('sam_disable_affinity_split', False):
+        return 'points'
+    mode = str(config.get('sam_prompt_mode', 'affinity') or 'affinity').strip().lower()
+    if mode not in ('affinity', 'points'):
+        raise ValueError('--sam-prompt-mode should be affinity or points, got {}'.format(mode))
+    return mode
+
+
 def build_sam_helper(config, save_root):
+    prompt_mode = resolve_sam_prompt_mode(config)
+    if prompt_mode == 'points':
+        from sam_helper_bf import SAMTrainHelper
+
+        print('Using legacy SAM point prompts from sam_helper_bf.py.')
+        return SAMTrainHelper(
+            checkpoint=config['sam_checkpoint'],
+            save_root=save_root,
+            model_type=config.get('sam_model_type', 'vit_l'),
+            device=config.get('sam_device', 'cuda'),
+            area_limit=DEFAULT_SAM_AREA_LIMIT,
+            score_thresh=config.get('sam_score_thresh', 0.60),
+            heat_iou_thresh=config.get('sam_heat_iou_thresh', 0.10),
+            large_target_heat_iou_thresh=DEFAULT_SAM_LARGE_TARGET_HEAT_IOU_THRESH,
+            bg_iou_thresh=DEFAULT_SAM_BG_IOU_THRESH,
+            large_target_bg_iou_thresh=DEFAULT_SAM_LARGE_TARGET_BG_IOU_THRESH,
+            large_area_thresh=config.get('sam_large_area_thresh', 0.06),
+            large_uncertain_area_thresh=DEFAULT_SAM_LARGE_UNCERTAIN_AREA_THRESH,
+            rule_a_heat_iou_thresh=DEFAULT_SAM_RULE_A_HEAT_IOU_THRESH,
+            rule_b_heat_iou_delta=DEFAULT_SAM_RULE_B_HEAT_IOU_DELTA,
+            resize_short_edge=config.get('sam_resize_short_edge', 640),
+            use_crf=config.get('sam_use_crf', False),
+            small_fg_box_thresh=DEFAULT_SAM_SMALL_FG_BOX_THRESH,
+        )
+
     from sam_helper import SAMTrainHelper
+
+    print('Using affinity SAM point prompts from sam_helper.py.')
 
     return SAMTrainHelper(
         checkpoint=config['sam_checkpoint'],
@@ -81,7 +117,7 @@ def build_sam_helper(config, save_root):
         resize_short_edge=config.get('sam_resize_short_edge', 640),
         use_crf=config.get('sam_use_crf', False),
         small_fg_box_thresh=DEFAULT_SAM_SMALL_FG_BOX_THRESH,
-        use_affinity_split=not config.get('sam_disable_affinity_split', False),
+        use_affinity_split=True,
         depth_root=config.get('sam_depth_root', ''),
         seed_points_per_instance=config.get('sam_seed_points_per_instance', 3),
         dino_weight=resolve_sam_dino_weight(config),

@@ -32,6 +32,12 @@ def get_config():
     parser.add_argument('--sam-large-area-thresh', default=0.06, type=float)
     parser.add_argument('--sam-resize-short-edge', default=640, type=int)
     parser.add_argument('--sam-use-crf', action='store_true')
+    parser.add_argument(
+        '--sam-prompt-mode',
+        default='affinity',
+        choices=['affinity', 'points'],
+        help='affinity: split CCAM prompt with depth/RGB/DINO affinity before SAM; points: use legacy sam_helper_bf.py five-point prompts.',
+    )
     parser.add_argument('--sam-depth-root', default='', help='Optional depth map root for CCAM prompt affinity splitting.')
     parser.add_argument('--sam-dino-weight', default='', help='Optional DINOv2 checkpoint for semantic affinity splitting.')
     parser.add_argument('--sam-dino-model', default='dinov2_vitl14', help='DINOv2 torch hub model name.')
@@ -39,7 +45,7 @@ def get_config():
     parser.add_argument('--sam-dino-device', default='', help='Device for DINO inference. Empty means same as --sam-device.')
     parser.add_argument('--sam-dino-max-side', default=700, type=int, help='Maximum long side for DINO inference. 0 means full resolution.')
     parser.add_argument('--sam-dino-pca-dim', default=64, type=int, help='PCA dimension for superpixel DINO descriptors.')
-    parser.add_argument('--sam-disable-affinity-split', action='store_true', help='Disable depth/RGB affinity instance splitting before SAM.')
+    parser.add_argument('--sam-disable-affinity-split', action='store_true', help='Compatibility alias for --sam-prompt-mode points.')
     parser.add_argument('--sam-seed-points-per-instance', default=3, type=int, help='Max positive SAM points sampled from each affinity instance.')
     parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Root used by SAMTrainHelper; labels are saved under pseudo_labels_binary/epoch1.')
     parser.add_argument('--pseudo-root', default='', help='Existing or generated pseudo-label directory used for stage-2 training.')
@@ -53,6 +59,8 @@ def get_config():
     
     # Config post-process
     config['use_sam_pseudo'] = bool(config['use_sam_pseudo'] or config['sam_checkpoint'])
+    if config.get('sam_disable_affinity_split', False):
+        config['sam_prompt_mode'] = 'points'
     config['params'] = [['encoder', config['lr'] / 10], ['decoder', config['lr']]]
     config['lr_decay'] = 0.9
     if config['use_sam_pseudo']:
