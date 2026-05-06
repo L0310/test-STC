@@ -738,8 +738,6 @@ class SAMTrainHelper:
         large_points: int = 5,
         small_points: int = 1,
         large_uncertain_area_thresh: float = 0.30,
-        rule_a_heat_iou_thresh: float = 0.4,
-        rule_b_heat_iou_delta: float = 0.05,
         heat_bin_thr: float = 0.5,
         resize_short_edge: int = 640,
         use_crf: bool = False,
@@ -786,8 +784,6 @@ class SAMTrainHelper:
         self.large_points = large_points
         self.small_points = small_points
         self.large_uncertain_area_thresh = large_uncertain_area_thresh
-        self.rule_a_heat_iou_thresh = rule_a_heat_iou_thresh
-        self.rule_b_heat_iou_delta = rule_b_heat_iou_delta
         self.heat_bin_thr = heat_bin_thr
         self.resize_short_edge = resize_short_edge
         self.use_crf = use_crf
@@ -1209,94 +1205,52 @@ class SAMTrainHelper:
     def _select_best_candidates(
         self,
         valid_candidates_by_point: Dict[int, List[SAMCandidate]],
-    ) -> List[SAMCandidate]:
-        selected_candidates: List[SAMCandidate] = []
-        for point_idx in sorted(valid_candidates_by_point.keys()):
-            point_candidates = valid_candidates_by_point[point_idx]
-
-            best_heat_candidate = max(
-                point_candidates,
-                key=lambda item: (float(item.filter_heat_iou), float(item.score)),
-            )
-            selected_candidates.append(best_heat_candidate)
-
-            best_score_candidate = max(
-                point_candidates,
-                key=lambda item: (float(item.score), float(item.filter_heat_iou)),
-            )
-            if id(best_score_candidate) != id(best_heat_candidate):
-                selected_candidates.append(best_score_candidate)
-        return selected_candidates
-
-    def _select_rule_a_candidates(
-        self,
-        valid_candidates_by_point: Dict[int, List[SAMCandidate]],
-    ) -> List[SAMCandidate]:
-        selected_candidates: List[SAMCandidate] = []
-        for point_idx in sorted(valid_candidates_by_point.keys()):
-            for candidate in valid_candidates_by_point[point_idx]:
-                if candidate.filter_heat_iou >= self.rule_a_heat_iou_thresh:
-                    selected_candidates.append(candidate)
-        return selected_candidates
-
-    def _select_rule_ab_candidates(
-        self,
-        valid_candidates_by_point: Dict[int, List[SAMCandidate]],
+        fg_candidates_by_point: Optional[Dict[int, List[SAMCandidate]]] = None,
+        fg_score_thresh: float = 0.9,
+        fg_iou_thresh: Optional[float] = None,
     ) -> List[SAMCandidate]:
         selected_candidates: List[SAMCandidate] = []
         seen_candidate_ids = set()
 
-        for point_idx in sorted(valid_candidates_by_point.keys()):
-            point_candidates = valid_candidates_by_point[point_idx]
-            point_best_heat_iou = max(float(candidate.filter_heat_iou) for candidate in point_candidates)
+        def _add_candidate(candidate: SAMCandidate) -> None:
+            candidate_id = id(candidate)
+            if candidate_id in seen_candidate_ids:
+                return
+            seen_candidate_ids.add(candidate_id)
+            selected_candidates.append(candidate)
 
-            if point_best_heat_iou >= self.rule_a_heat_iou_thresh:
-                point_selected = [
-                    candidate for candidate in point_candidates
-                    if candidate.filter_heat_iou >= self.rule_a_heat_iou_thresh
-                ]
-            else:
-                point_selected = [
-                    candidate for candidate in point_candidates
-                    if point_best_heat_iou - float(candidate.filter_heat_iou) <= self.rule_b_heat_iou_delta
-                ]
+        point_indices = set(valid_candidates_by_point.keys())
+        if fg_candidates_by_point is not None:
+            point_indices.update(fg_candidates_by_point.keys())
 
-            for candidate in point_selected:
-                candidate_id = id(candidate)
-                if candidate_id not in seen_candidate_ids:
-                    seen_candidate_ids.add(candidate_id)
-                    selected_candidates.append(candidate)
+        for point_idx in sorted(point_indices):
+            point_candidates = valid_candidates_by_point.get(point_idx, [])
+            if point_candidates:
+                best_heat_candidate = max(
+                    point_candidates,
+                    key=lambda item: (float(item.filter_heat_iou), float(item.score)),
+                )
+                _add_candidate(best_heat_candidate)
 
-        return selected_candidates
+                best_score_candidate = max(
+                    point_candidates,
+                    key=lambda item: (float(item.score), float(item.filter_heat_iou)),
+                )
+                _add_candidate(best_score_candidate)
 
-    def _select_rule_b_candidates(
-        self,
-        valid_candidates_by_point: Dict[int, List[SAMCandidate]],
-    ) -> List[SAMCandidate]:
-        selected_candidates: List[SAMCandidate] = []
-        seen_candidate_ids = set()
-
-        for point_idx in sorted(valid_candidates_by_point.keys()):
-            point_candidates = valid_candidates_by_point[point_idx]
-            best_candidate = max(
-                point_candidates,
-                key=lambda item: (float(item.filter_heat_iou), float(item.score)),
+            if fg_candidates_by_point is None or point_idx not in fg_candidates_by_point:
+                continue
+            fg_candidates = fg_candidates_by_point[point_idx]
+            if not fg_candidates:
+                continue
+            best_fg_candidate = max(
+                fg_candidates,
+                key=lambda item: (float(item.fg_iou), float(item.score)),
             )
-            point_best_heat_iou = float(best_candidate.filter_heat_iou)
-
-            if point_best_heat_iou < self.rule_a_heat_iou_thresh:
-                point_selected = [
-                    candidate for candidate in point_candidates
-                    if point_best_heat_iou - float(candidate.filter_heat_iou) <= self.rule_b_heat_iou_delta
-                ]
-            else:
-                point_selected = [best_candidate]
-
-            for candidate in point_selected:
-                candidate_id = id(candidate)
-                if candidate_id not in seen_candidate_ids:
-                    seen_candidate_ids.add(candidate_id)
-                    selected_candidates.append(candidate)
+            if float(best_fg_candidate.score) > float(fg_score_thresh) and (
+                fg_iou_thresh is None or float(best_fg_candidate.fg_iou) > float(fg_iou_thresh)
+            ):
+                _add_candidate(best_fg_candidate)
 
         return selected_candidates
 
@@ -1746,24 +1700,26 @@ class SAMTrainHelper:
                 heat_iou_thresh=heat_iou_thresh,
                 bg_iou_thresh=bg_iou_thresh,
             )
-            kept_candidates = self._select_best_candidates(valid_candidates_by_point)
+            fg_candidates_by_point = candidates_by_point if candidate_fg_iou_masks_by_point is not None else None
+            kept_candidates = self._select_best_candidates(
+                valid_candidates_by_point,
+                fg_candidates_by_point=fg_candidates_by_point,
+                fg_score_thresh=0.9,
+            )
+            rule_a_candidates = self._select_best_candidates(
+                valid_candidates_by_point,
+                fg_candidates_by_point=fg_candidates_by_point,
+                fg_score_thresh=0.9,
+                fg_iou_thresh=0.15,
+            )
             if kept_candidates:
                 final_mask = self._merge_candidate_masks(kept_candidates, fallback_mask)
             else:
                 self._record_failure(sample_name, epoch)
                 final_mask = fallback_mask.copy()
 
-            rule_a_candidates = self._select_rule_a_candidates(valid_candidates_by_point)
-            rule_b_candidates = self._select_rule_b_candidates(valid_candidates_by_point)
-            rule_ab_candidates = self._select_rule_ab_candidates(valid_candidates_by_point)
-
-            rule_a_mask = self._merge_candidate_masks(rule_a_candidates, final_mask)
-            rule_b_mask = self._merge_candidate_masks(rule_b_candidates, final_mask)
-            rule_ab_mask = self._merge_candidate_masks(rule_ab_candidates, final_mask)
             final_prob = self._merge_candidate_prob_maps(kept_candidates, fallback_mask)
-            rule_a_prob = self._merge_candidate_prob_maps(rule_a_candidates, final_mask)
-            rule_b_prob = self._merge_candidate_prob_maps(rule_b_candidates, final_mask)
-            rule_ab_prob = self._merge_candidate_prob_maps(rule_ab_candidates, final_mask)
+            rule_a_prob = self._merge_candidate_prob_maps(rule_a_candidates, fallback_mask)
 
             self._save_points_heatmap_overlay(image_rgb, prob_np, points_xy, box_xyxy, sample_name, epoch)
             self._save_points_seg_overlay(
@@ -1815,22 +1771,6 @@ class SAMTrainHelper:
                 epoch,
                 prefix="pseudo_labels_rule_a",
             )
-            self._save_pseudo_label_grayscale(
-                rule_b_prob,
-                sample_name,
-                sample_meta,
-                idx,
-                epoch,
-                prefix="pseudo_labels_rule_b",
-            )
-            self._save_pseudo_label_grayscale(
-                rule_ab_prob,
-                sample_name,
-                sample_meta,
-                idx,
-                epoch,
-                prefix="pseudo_labels_rule_ab",
-            )
             self._save_pseudo_label_binary(
                 image_rgb,
                 final_prob,
@@ -1848,24 +1788,6 @@ class SAMTrainHelper:
                 idx,
                 epoch,
                 prefix="pseudo_labels_rule_a_binary",
-            )
-            self._save_pseudo_label_binary(
-                image_rgb,
-                rule_b_prob,
-                sample_name,
-                sample_meta,
-                idx,
-                epoch,
-                prefix="pseudo_labels_rule_b_binary",
-            )
-            self._save_pseudo_label_binary(
-                image_rgb,
-                rule_ab_prob,
-                sample_name,
-                sample_meta,
-                idx,
-                epoch,
-                prefix="pseudo_labels_rule_ab_binary",
             )
             self._save_final_candidates(
                 image_rgb,
