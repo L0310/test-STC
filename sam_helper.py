@@ -151,6 +151,31 @@ def _label_map_to_components(label_map: np.ndarray, min_area: int = 16) -> List[
     return [component for _, component in components]
 
 
+def _draw_label_grid_overlay(
+    image_rgb: np.ndarray,
+    label_map: np.ndarray,
+    color: Tuple[int, int, int] = (0, 255, 0),
+    thickness: int = 1,
+) -> np.ndarray:
+    image = _ensure_uint8_rgb(image_rgb).copy()
+    labels = np.asarray(label_map, dtype=np.int32)
+    if labels.shape != image.shape[:2]:
+        labels = cv2.resize(labels, image.shape[:2][::-1], interpolation=cv2.INTER_NEAREST)
+    valid = labels > 0
+    boundary = np.zeros(labels.shape, dtype=np.uint8)
+    horizontal = (labels[:, 1:] != labels[:, :-1]) & (valid[:, 1:] | valid[:, :-1])
+    vertical = (labels[1:, :] != labels[:-1, :]) & (valid[1:, :] | valid[:-1, :])
+    boundary[:, 1:][horizontal] = 1
+    boundary[:, :-1][horizontal] = 1
+    boundary[1:, :][vertical] = 1
+    boundary[:-1, :][vertical] = 1
+    if int(thickness) > 1:
+        kernel = np.ones((int(thickness), int(thickness)), dtype=np.uint8)
+        boundary = cv2.dilate(boundary, kernel, iterations=1)
+    image[boundary > 0] = np.array(color, dtype=np.uint8)
+    return image
+
+
 def _nearest_mask_point(mask: np.ndarray, x: float, y: float) -> Tuple[float, float]:
     ys, xs = np.where(mask > 0)
     if len(xs) == 0:
@@ -901,14 +926,14 @@ class SAMTrainHelper:
         prompt_mask: np.ndarray,
         image_rgb: np.ndarray,
         depth_map: Optional[np.ndarray],
-    ) -> List[np.ndarray]:
+    ) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
         prompt_mask = _ensure_binary_mask(prompt_mask)
         if int(prompt_mask.sum()) <= 0:
-            return []
+            return [], None
         try:
             from skimage.segmentation import slic
         except Exception:
-            return _connected_components(prompt_mask)
+            return _connected_components(prompt_mask), None
 
         depth = (
             _normalize_gray_map(depth_map)
@@ -970,17 +995,17 @@ class SAMTrainHelper:
                 label_map[component > 0] = next_label
                 next_label += 1
 
-        return _label_map_to_components(label_map, min_area=max(16, int(self.affinity_min_instance_area // 2)))
+        return _label_map_to_components(label_map, min_area=max(16, int(self.affinity_min_instance_area // 2))), label_map
 
     def _split_prompt_mask_into_affinity_instances(
         self,
         prompt_mask: np.ndarray,
         image_rgb: np.ndarray,
         depth_map: Optional[np.ndarray],
-    ) -> List[np.ndarray]:
+    ) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
         prompt_mask = _ensure_binary_mask(prompt_mask)
         if int(prompt_mask.sum()) <= 0:
-            return []
+            return [], None
         depth = (
             _normalize_gray_map(depth_map)
             if depth_map is not None
@@ -1021,7 +1046,11 @@ class SAMTrainHelper:
                 min_area=max(16, int(self.affinity_min_instance_area // 2)),
             )
             if components:
-                return components
+                superpixel_label_map = np.asarray(
+                    results.get("superpixel_label_map", np.zeros_like(prompt_mask, dtype=np.int32)),
+                    dtype=np.int32,
+                )
+                return components, superpixel_label_map
         except Exception as exc:
             if not hasattr(self, "_affinity_import_warned"):
                 self._affinity_import_warned = True
@@ -1030,8 +1059,8 @@ class SAMTrainHelper:
                     "Using local RGB/depth SLIC split fallback.".format(exc)
                 )
 
-        components = self._split_prompt_mask_with_local_affinity(prompt_mask, image_rgb, depth_map)
-        return components if components else _connected_components(prompt_mask)
+        components, superpixel_label_map = self._split_prompt_mask_with_local_affinity(prompt_mask, image_rgb, depth_map)
+        return (components if components else _connected_components(prompt_mask)), superpixel_label_map
 
     def _run_sam_single(self, image_rgb: np.ndarray, points_xy: np.ndarray) -> List[SAMCandidate]:
         self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb)))
@@ -1347,6 +1376,7 @@ class SAMTrainHelper:
         prompt_mask: np.ndarray,
         seed_masks: List[np.ndarray],
         points_xy: np.ndarray,
+        superpixel_label_map: Optional[np.ndarray],
         filename: str,
         epoch: int,
     ) -> None:
@@ -1357,6 +1387,7 @@ class SAMTrainHelper:
         overlay_dir = self._make_out_dir("affinity_split_overlay", epoch)
         label_dir = self._make_out_dir("affinity_split_labels", epoch)
         union_dir = self._make_out_dir("affinity_split_union", epoch)
+        superpixel_overlay_dir = self._make_out_dir("affinity_superpixel_overlay", epoch)
 
         prompt_mask = _ensure_binary_mask(prompt_mask)
         seed_masks = [_ensure_binary_mask(seed_mask) for seed_mask in seed_masks if int(_ensure_binary_mask(seed_mask).sum()) > 0]
@@ -1369,6 +1400,14 @@ class SAMTrainHelper:
         cv2.imwrite(os.path.join(union_dir, f"{stem}.png"), union_mask.astype(np.uint8) * 255)
         _write_rgb(os.path.join(label_dir, f"{stem}.png"), label_rgb)
         _write_rgb(os.path.join(overlay_dir, f"{stem}.png"), overlay)
+        if superpixel_label_map is not None and int((np.asarray(superpixel_label_map) > 0).sum()) > 0:
+            superpixel_overlay = _draw_label_grid_overlay(
+                image_rgb,
+                np.asarray(superpixel_label_map, dtype=np.int32),
+                color=(0, 255, 0),
+                thickness=1,
+            )
+            _write_rgb(os.path.join(superpixel_overlay_dir, f"{stem}.png"), superpixel_overlay)
 
     def _save_per_point_candidates(
         self,
@@ -1602,7 +1641,7 @@ class SAMTrainHelper:
                 candidate_metric_heat_iou_mask = prompt_mask.copy()
                 candidate_fg_iou_masks_by_point = {}
                 depth_map = self._load_depth_map(sample_name, prompt_mask.shape)
-                components = self._split_prompt_mask_into_affinity_instances(
+                components, superpixel_label_map = self._split_prompt_mask_into_affinity_instances(
                     prompt_mask=prompt_mask,
                     image_rgb=image_rgb,
                     depth_map=depth_map,
@@ -1647,6 +1686,7 @@ class SAMTrainHelper:
                     prompt_mask,
                     components,
                     points_xy,
+                    superpixel_label_map,
                     sample_name,
                     epoch,
                 )
