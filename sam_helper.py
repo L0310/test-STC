@@ -747,18 +747,18 @@ class SAMTrainHelper:
         seed_points_per_instance: int = 3,
         affinity_min_component_area: int = 128,
         affinity_min_instance_area: int = 64,
-        affinity_superpixel_size: int = 20,
-        affinity_min_superpixel_area: int = 48,
+        affinity_superpixel_size: int = 18,
+        affinity_min_superpixel_area: int = 40,
         affinity_slic_compactness: float = 6.0,
         affinity_slic_sigma: float = 0.0,
         affinity_slic_depth_scale: float = 0.5,
         affinity_sigma_sem: float = 0.20,
-        affinity_sigma_dep: float = 0.04,
+        affinity_sigma_dep: float = 0.02,
         affinity_sigma_spatial: float = 0.12,
-        affinity_sigma_edge: float = 0.30,
+        affinity_sigma_edge: float = 0.20,
         affinity_min_affinity: float = 1e-6,
         affinity_min_cluster_regions: int = 2,
-        affinity_ncut_threshold: float = 0.12,
+        affinity_ncut_threshold: float = 0.10,
         affinity_max_recursion_depth: int = 8,
         dino_weight: str = "",
         dino_model: str = "dinov2_vitl14",
@@ -1208,6 +1208,7 @@ class SAMTrainHelper:
         fg_candidates_by_point: Optional[Dict[int, List[SAMCandidate]]] = None,
         fg_score_thresh: float = 0.9,
         fg_iou_thresh: Optional[float] = None,
+        fg_bg_iou_thresh: float = 0.15,
     ) -> List[SAMCandidate]:
         selected_candidates: List[SAMCandidate] = []
         seen_candidate_ids = set()
@@ -1243,14 +1244,19 @@ class SAMTrainHelper:
             fg_candidates = fg_candidates_by_point[point_idx]
             if not fg_candidates:
                 continue
+            valid_fg_candidates = [
+                candidate for candidate in fg_candidates
+                if float(candidate.score) > float(fg_score_thresh)
+                and float(candidate.filter_bg_iou) <= float(fg_bg_iou_thresh)
+                and (fg_iou_thresh is None or float(candidate.fg_iou) > float(fg_iou_thresh))
+            ]
+            if not valid_fg_candidates:
+                continue
             best_fg_candidate = max(
-                fg_candidates,
+                valid_fg_candidates,
                 key=lambda item: (float(item.fg_iou), float(item.score)),
             )
-            if float(best_fg_candidate.score) > float(fg_score_thresh) and (
-                fg_iou_thresh is None or float(best_fg_candidate.fg_iou) > float(fg_iou_thresh)
-            ):
-                _add_candidate(best_fg_candidate)
+            _add_candidate(best_fg_candidate)
 
         return selected_candidates
 
@@ -1705,12 +1711,14 @@ class SAMTrainHelper:
                 valid_candidates_by_point,
                 fg_candidates_by_point=fg_candidates_by_point,
                 fg_score_thresh=0.9,
+                fg_bg_iou_thresh=0.15,
             )
             rule_a_candidates = self._select_best_candidates(
                 valid_candidates_by_point,
                 fg_candidates_by_point=fg_candidates_by_point,
                 fg_score_thresh=0.9,
                 fg_iou_thresh=0.15,
+                fg_bg_iou_thresh=0.15,
             )
             if kept_candidates:
                 final_mask = self._merge_candidate_masks(kept_candidates, fallback_mask)
