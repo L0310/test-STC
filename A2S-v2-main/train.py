@@ -97,7 +97,10 @@ def build_sam_helper(config, save_root):
 
     from sam_helper import SAMTrainHelper
 
-    print('Using affinity SAM point prompts from sam_helper.py.')
+    if config.get('sam_affinity_use_mask_prompt', False):
+        print('Using affinity SAM point prompts plus positive mask prompts from sam_helper.py.')
+    else:
+        print('Using affinity SAM point prompts from sam_helper.py.')
 
     return SAMTrainHelper(
         checkpoint=config['sam_checkpoint'],
@@ -112,14 +115,13 @@ def build_sam_helper(config, save_root):
         large_target_bg_iou_thresh=DEFAULT_SAM_LARGE_TARGET_BG_IOU_THRESH,
         large_area_thresh=config.get('sam_large_area_thresh', 0.06),
         large_uncertain_area_thresh=DEFAULT_SAM_LARGE_UNCERTAIN_AREA_THRESH,
-        rule_a_heat_iou_thresh=DEFAULT_SAM_RULE_A_HEAT_IOU_THRESH,
-        rule_b_heat_iou_delta=DEFAULT_SAM_RULE_B_HEAT_IOU_DELTA,
         resize_short_edge=config.get('sam_resize_short_edge', 640),
         use_crf=config.get('sam_use_crf', False),
         small_fg_box_thresh=DEFAULT_SAM_SMALL_FG_BOX_THRESH,
         use_affinity_split=True,
         depth_root=config.get('sam_depth_root', ''),
         seed_points_per_instance=config.get('sam_seed_points_per_instance', 3),
+        affinity_use_mask_prompt=config.get('sam_affinity_use_mask_prompt', False),
         dino_weight=resolve_sam_dino_weight(config),
         dino_model=config.get('sam_dino_model', 'dinov2_vitl14'),
         dino_repo=config.get('sam_dino_repo', ''),

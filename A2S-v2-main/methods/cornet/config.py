@@ -47,7 +47,12 @@ def get_config():
     parser.add_argument('--sam-dino-pca-dim', default=64, type=int, help='PCA dimension for superpixel DINO descriptors.')
     parser.add_argument('--sam-disable-affinity-split', action='store_true', help='Compatibility alias for --sam-prompt-mode points.')
     parser.add_argument('--sam-seed-points-per-instance', default=3, type=int, help='Max positive SAM points sampled from each affinity instance.')
-    parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Root used by SAMTrainHelper; labels are saved under pseudo_labels_binary/epoch1.')
+    parser.add_argument(
+        '--sam-affinity-use-mask-prompt',
+        action='store_true',
+        help='In affinity mode, also save SAM results that use each affinity instance seed mask as a positive mask prompt plus its positive points.',
+    )
+    parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Root used by SAMTrainHelper; point labels are saved under pseudo_labels_binary/epoch1, and mask+point labels under pseudo_labels_mask_point_binary/epoch1.')
     parser.add_argument('--pseudo-root', default='', help='Existing or generated pseudo-label directory used for stage-2 training.')
     parser.add_argument('--ccam-hith', default=0.55, type=float, help='High threshold for CCAM foreground prompt.')
     parser.add_argument('--ccam-loth', default=0.15, type=float, help='Low threshold for CCAM background mask.')
