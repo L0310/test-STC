@@ -592,6 +592,7 @@ class SAMTrainHelper:
         resize_short_edge: int = 640,
         use_crf: bool = False,
         small_fg_box_thresh: float = 0.04,
+        use_mask_prompt: bool = False,
     ):
         if not checkpoint or not os.path.exists(checkpoint):
             raise FileNotFoundError(f"SAM checkpoint not found: {checkpoint}")
@@ -616,9 +617,12 @@ class SAMTrainHelper:
         self.resize_short_edge = resize_short_edge
         self.use_crf = use_crf
         self.small_fg_box_thresh = small_fg_box_thresh
+        self.use_mask_prompt = bool(use_mask_prompt)
         self.mask_logit_threshold = float(self.predictor.model.mask_threshold)
         self.mask_prob_threshold = float(1.0 / (1.0 + np.exp(-self.mask_logit_threshold)))
         self.failed_names: Dict[int, List[str]] = {}
+        if self.use_mask_prompt:
+            print("Saving legacy point-only pseudo labels and point+mask pseudo labels.")
 
     def _make_out_dir(self, prefix: str, epoch: int) -> str:
         out_dir = os.path.join(self.save_root, prefix, f"epoch{epoch + 1}")
@@ -651,8 +655,14 @@ class SAMTrainHelper:
 
         return np.array(selected_points, dtype=np.float32)
 
-    def _run_sam_single(self, image_rgb: np.ndarray, points_xy: np.ndarray) -> List[SAMCandidate]:
-        self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb)))
+    def _run_sam_single(
+        self,
+        image_rgb: np.ndarray,
+        points_xy: np.ndarray,
+        set_image: bool = True,
+    ) -> List[SAMCandidate]:
+        if set_image:
+            self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb)))
         candidates: List[SAMCandidate] = []
         for point_idx in range(points_xy.shape[0]):
             point = points_xy[point_idx:point_idx + 1].astype(np.float32)
@@ -660,6 +670,56 @@ class SAMTrainHelper:
             mask_logits, scores, _ = self.predictor.predict(
                 point_coords=point,
                 point_labels=point_labels,
+                multimask_output=self.multimask_output,
+                return_logits=True,
+            )
+            for logit_mask, score in zip(np.asarray(mask_logits), np.asarray(scores).reshape(-1)):
+                prob_map = _logits_to_prob_map(logit_mask)
+                candidates.append(
+                    SAMCandidate(
+                        mask=_threshold_prob_map(prob_map, self.mask_prob_threshold),
+                        score=float(score),
+                        point_idx=point_idx,
+                        logits=np.asarray(logit_mask, dtype=np.float32),
+                    )
+                )
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        return candidates
+
+    @staticmethod
+    def _build_positive_mask_prompt(seed_mask: np.ndarray, mask_size: int = 256, positive_logit: float = 3.0) -> np.ndarray:
+        seed_mask = _ensure_binary_mask(seed_mask).astype(np.float32)
+        if int(seed_mask.sum()) <= 0:
+            return np.zeros((1, int(mask_size), int(mask_size)), dtype=np.float32)
+        mask_prompt = cv2.resize(
+            seed_mask,
+            (int(mask_size), int(mask_size)),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        mask_prompt = np.clip(mask_prompt, 0.0, 1.0).astype(np.float32) * float(positive_logit)
+        return mask_prompt[None, :, :]
+
+    def _run_sam_single_with_mask_prompt(
+        self,
+        image_rgb: np.ndarray,
+        points_xy: np.ndarray,
+        seed_mask: np.ndarray,
+        set_image: bool = True,
+    ) -> List[SAMCandidate]:
+        if points_xy.shape[0] == 0:
+            return []
+
+        if set_image:
+            self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb)))
+        candidates: List[SAMCandidate] = []
+        mask_input = self._build_positive_mask_prompt(seed_mask)
+        for point_idx in range(points_xy.shape[0]):
+            point = points_xy[point_idx:point_idx + 1].astype(np.float32)
+            point_labels = np.ones((1,), dtype=np.int32)
+            mask_logits, scores, _ = self.predictor.predict(
+                point_coords=point,
+                point_labels=point_labels,
+                mask_input=mask_input,
                 multimask_output=self.multimask_output,
                 return_logits=True,
             )
@@ -937,10 +997,11 @@ class SAMTrainHelper:
         box_xyxy: Optional[np.ndarray],
         filename: str,
         epoch: int,
+        prefix: str = "points_sam_seg",
     ) -> None:
         if mask_orig is None:
             return
-        out_dir = self._make_out_dir("points_sam_seg", epoch)
+        out_dir = self._make_out_dir(prefix, epoch)
         stem = os.path.splitext(filename)[0]
         overlay_orig = SAMHelper.draw_mask_overlay(image_rgb, mask_orig)
         if box_xyxy is not None:
@@ -1010,11 +1071,12 @@ class SAMTrainHelper:
         uncertain_area_ratio: float,
         filename: str,
         epoch: int,
+        prefix: str = "sam_final_candidates",
     ) -> None:
         if not candidates:
             return
         stem = os.path.splitext(filename)[0]
-        sample_dir = os.path.join(self._make_out_dir("sam_final_candidates", epoch), stem)
+        sample_dir = os.path.join(self._make_out_dir(prefix, epoch), stem)
         os.makedirs(sample_dir, exist_ok=True)
 
         for candidate in candidates:
@@ -1142,6 +1204,7 @@ class SAMTrainHelper:
             fallback_mask = prompt_mask.copy()
             box_raw_candidates: List[SAMCandidate] = []
             point_candidate_prefixes = ["point_candidates"]
+            mask_prompt_raw_candidates: List[SAMCandidate] = []
             if fg_area_ratio < self.small_fg_box_thresh:
                 box_xyxy = _mask_to_box(prompt_mask)
                 if box_xyxy is None:
@@ -1171,7 +1234,6 @@ class SAMTrainHelper:
                     self._record_failure(sample_name, epoch)
                     continue
                 points_xy_aug = _scale_points(points_xy, prompt_mask.shape, aug_hw)
-                raw_candidates = self._run_sam_single(image_rgb_aug, points_xy_aug)
                 candidate_heat_iou_ref_mask = np.logical_or(
                     _ensure_binary_mask(prompt_mask).astype(bool),
                     _ensure_binary_mask(box_mask).astype(bool),
@@ -1184,7 +1246,15 @@ class SAMTrainHelper:
                     self._record_failure(sample_name, epoch)
                     continue
                 points_xy_aug = _scale_points(points_xy, prompt_mask.shape, aug_hw)
-                raw_candidates = self._run_sam_single(image_rgb_aug, points_xy_aug)
+            self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb_aug)))
+            raw_candidates = self._run_sam_single(image_rgb_aug, points_xy_aug, set_image=False)
+            if self.use_mask_prompt:
+                mask_prompt_raw_candidates = self._run_sam_single_with_mask_prompt(
+                    image_rgb_aug,
+                    points_xy_aug,
+                    prompt_mask,
+                    set_image=False,
+                )
             candidates_by_point = self._prepare_candidates_by_point(raw_candidates, candidate_heat_iou_ref_mask, bg_mask)
             valid_candidates_by_point = self._get_valid_candidates_by_point(
                 candidates_by_point,
@@ -1319,6 +1389,190 @@ class SAMTrainHelper:
                 sample_name,
                 epoch,
             )
+            if self.use_mask_prompt:
+                mask_candidates_by_point = self._prepare_candidates_by_point(
+                    mask_prompt_raw_candidates,
+                    candidate_heat_iou_ref_mask,
+                    bg_mask,
+                )
+                valid_mask_candidates_by_point = self._get_valid_candidates_by_point(
+                    mask_candidates_by_point,
+                    heat_iou_thresh=heat_iou_thresh,
+                    bg_iou_thresh=bg_iou_thresh,
+                )
+                mask_kept_candidates = self._select_best_candidates(valid_mask_candidates_by_point)
+                mask_rule_a_candidates = self._select_rule_a_candidates(valid_mask_candidates_by_point)
+                mask_rule_b_candidates = self._select_rule_b_candidates(valid_mask_candidates_by_point)
+                mask_rule_ab_candidates = self._select_rule_ab_candidates(valid_mask_candidates_by_point)
+
+                mask_final_prob = self._merge_candidate_prob_maps(mask_kept_candidates, fallback_mask)
+                mask_rule_a_prob = self._merge_candidate_prob_maps(mask_rule_a_candidates, fallback_mask)
+                mask_rule_b_prob = self._merge_candidate_prob_maps(mask_rule_b_candidates, fallback_mask)
+                mask_rule_ab_prob = self._merge_candidate_prob_maps(mask_rule_ab_candidates, fallback_mask)
+
+                mask_final_mask = _threshold_prob_map(mask_final_prob, self.mask_prob_threshold)
+                mask_rule_a_mask = _threshold_prob_map(mask_rule_a_prob, self.mask_prob_threshold)
+                mask_rule_b_mask = _threshold_prob_map(mask_rule_b_prob, self.mask_prob_threshold)
+                mask_rule_ab_mask = _threshold_prob_map(mask_rule_ab_prob, self.mask_prob_threshold)
+
+                self._save_points_seg_overlay(
+                    image_rgb,
+                    mask_final_mask,
+                    points_xy,
+                    box_xyxy,
+                    sample_name,
+                    epoch,
+                    prefix="mask_point_sam_seg",
+                )
+                self._save_points_seg_overlay(
+                    image_rgb,
+                    mask_rule_a_mask,
+                    points_xy,
+                    box_xyxy,
+                    sample_name,
+                    epoch,
+                    prefix="mask_point_sam_seg_rule_a",
+                )
+                self._save_points_seg_overlay(
+                    image_rgb,
+                    mask_rule_b_mask,
+                    points_xy,
+                    box_xyxy,
+                    sample_name,
+                    epoch,
+                    prefix="mask_point_sam_seg_rule_b",
+                )
+                self._save_points_seg_overlay(
+                    image_rgb,
+                    mask_rule_ab_mask,
+                    points_xy,
+                    box_xyxy,
+                    sample_name,
+                    epoch,
+                    prefix="mask_point_sam_seg_rule_ab",
+                )
+                self._save_per_point_candidates(
+                    image_rgb,
+                    mask_prompt_raw_candidates,
+                    points_xy,
+                    box_xyxy,
+                    candidate_heat_iou_ref_mask,
+                    bg_mask,
+                    uncertain_area_ratio,
+                    sample_name,
+                    epoch,
+                    output_prefixes=["mask_point_candidates"],
+                )
+                self._save_pseudo_label_grayscale(
+                    mask_final_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point",
+                )
+                self._save_pseudo_label_grayscale(
+                    mask_rule_a_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point_rule_a",
+                )
+                self._save_pseudo_label_grayscale(
+                    mask_rule_b_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point_rule_b",
+                )
+                self._save_pseudo_label_grayscale(
+                    mask_rule_ab_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point_rule_ab",
+                )
+                self._save_pseudo_label_binary(
+                    image_rgb,
+                    mask_final_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point_binary",
+                )
+                self._save_pseudo_label_binary(
+                    image_rgb,
+                    mask_rule_a_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point_rule_a_binary",
+                )
+                self._save_pseudo_label_binary(
+                    image_rgb,
+                    mask_rule_b_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point_rule_b_binary",
+                )
+                self._save_pseudo_label_binary(
+                    image_rgb,
+                    mask_rule_ab_prob,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    prefix="pseudo_labels_mask_point_rule_ab_binary",
+                )
+                self._save_final_candidates(
+                    image_rgb,
+                    mask_kept_candidates,
+                    points_xy,
+                    box_xyxy,
+                    uncertain_area_ratio,
+                    sample_name,
+                    epoch,
+                    prefix="sam_mask_point_final_candidates",
+                )
+                self._save_final_candidates(
+                    image_rgb,
+                    mask_rule_a_candidates,
+                    points_xy,
+                    box_xyxy,
+                    uncertain_area_ratio,
+                    sample_name,
+                    epoch,
+                    prefix="sam_mask_point_final_candidates_rule_a",
+                )
+                self._save_final_candidates(
+                    image_rgb,
+                    mask_rule_b_candidates,
+                    points_xy,
+                    box_xyxy,
+                    uncertain_area_ratio,
+                    sample_name,
+                    epoch,
+                    prefix="sam_mask_point_final_candidates_rule_b",
+                )
+                self._save_final_candidates(
+                    image_rgb,
+                    mask_rule_ab_candidates,
+                    points_xy,
+                    box_xyxy,
+                    uncertain_area_ratio,
+                    sample_name,
+                    epoch,
+                    prefix="sam_mask_point_final_candidates_rule_ab",
+                )
+
+
 def _is_image_file(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in {".jpg", ".jpeg", ".png", ".bmp"}
 

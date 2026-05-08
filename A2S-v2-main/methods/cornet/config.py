@@ -48,9 +48,16 @@ def get_config():
     parser.add_argument('--sam-disable-affinity-split', action='store_true', help='Compatibility alias for --sam-prompt-mode points.')
     parser.add_argument('--sam-seed-points-per-instance', default=3, type=int, help='Max positive SAM points sampled from each affinity instance.')
     parser.add_argument(
-        '--sam-affinity-use-mask-prompt',
+        '--sam-use-mask-prompt',
+        dest='sam_affinity_use_mask_prompt',
         action='store_true',
-        help='In affinity mode, also save SAM results that use each affinity instance seed mask as a positive mask prompt plus its positive points.',
+        help='Also save SAM results using the CCAM prompt mask as a positive mask prompt plus the selected positive points.',
+    )
+    parser.add_argument(
+        '--sam-affinity-use-mask-prompt',
+        dest='sam_affinity_use_mask_prompt',
+        action='store_true',
+        help='Compatibility alias for --sam-use-mask-prompt.',
     )
     parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Root used by SAMTrainHelper; point labels are saved under pseudo_labels_binary/epoch1, and mask+point labels under pseudo_labels_mask_point_binary/epoch1.')
     parser.add_argument('--pseudo-root', default='', help='Existing or generated pseudo-label directory used for stage-2 training.')

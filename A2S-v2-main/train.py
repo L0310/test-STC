@@ -74,7 +74,10 @@ def build_sam_helper(config, save_root):
     if prompt_mode == 'points':
         from sam_helper_bf import SAMTrainHelper
 
-        print('Using legacy SAM point prompts from sam_helper_bf.py.')
+        if config.get('sam_affinity_use_mask_prompt', False):
+            print('Using legacy SAM point prompts plus positive mask prompts from sam_helper_bf.py.')
+        else:
+            print('Using legacy SAM point prompts from sam_helper_bf.py.')
         return SAMTrainHelper(
             checkpoint=config['sam_checkpoint'],
             save_root=save_root,
@@ -93,6 +96,7 @@ def build_sam_helper(config, save_root):
             resize_short_edge=config.get('sam_resize_short_edge', 640),
             use_crf=config.get('sam_use_crf', False),
             small_fg_box_thresh=DEFAULT_SAM_SMALL_FG_BOX_THRESH,
+            use_mask_prompt=config.get('sam_affinity_use_mask_prompt', False),
         )
 
     from sam_helper import SAMTrainHelper
