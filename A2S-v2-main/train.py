@@ -75,7 +75,7 @@ def build_sam_helper(config, save_root):
         from sam_helper_bf import SAMTrainHelper
 
         if config.get('sam_affinity_use_mask_prompt', False):
-            print('Using legacy SAM point prompts, positive mask prompts, and point+mask prompts from sam_helper_bf.py.')
+            print('Using legacy SAM point prompts plus positive mask prompts from sam_helper_bf.py.')
         else:
             print('Using legacy SAM point prompts from sam_helper_bf.py.')
         return SAMTrainHelper(
@@ -102,7 +102,7 @@ def build_sam_helper(config, save_root):
     from sam_helper import SAMTrainHelper
 
     if config.get('sam_affinity_use_mask_prompt', False):
-        print('Using affinity SAM point prompts plus positive mask prompts from sam_helper.py.')
+        print('Using affinity SAM point prompts plus instance-mask and whole-mask prompts from sam_helper.py.')
     else:
         print('Using affinity SAM point prompts from sam_helper.py.')
 
