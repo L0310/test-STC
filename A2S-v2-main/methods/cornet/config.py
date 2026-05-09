@@ -29,6 +29,8 @@ def get_config():
     parser.add_argument('--sam-device', default='cuda', help='Device for SAM inference.')
     parser.add_argument('--sam-score-thresh', default=0.60, type=float)
     parser.add_argument('--sam-heat-iou-thresh', default=0.10, type=float)
+    parser.add_argument('--sam-bg-iou-thresh', default=0.15, type=float, help='Maximum SAM candidate IoU with the CCAM background region for normal targets.')
+    parser.add_argument('--sam-large-target-bg-iou-thresh', default=0.30, type=float, help='Maximum SAM candidate IoU with the CCAM background region for large/uncertain targets.')
     parser.add_argument('--sam-large-area-thresh', default=0.06, type=float)
     parser.add_argument('--sam-resize-short-edge', default=640, type=int)
     parser.add_argument('--sam-use-crf', action='store_true')
@@ -51,7 +53,7 @@ def get_config():
         '--sam-use-mask-prompt',
         dest='sam_affinity_use_mask_prompt',
         action='store_true',
-        help='Also save SAM results using the CCAM prompt mask as a positive mask prompt plus the selected positive points.',
+        help='Also save SAM results using the CCAM prompt mask as a positive mask prompt. Points mode saves mask-only and point+mask results.',
     )
     parser.add_argument(
         '--sam-affinity-use-mask-prompt',
@@ -59,7 +61,7 @@ def get_config():
         action='store_true',
         help='Compatibility alias for --sam-use-mask-prompt.',
     )
-    parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Root used by SAMTrainHelper; point labels are saved under pseudo_labels_binary/epoch1, and mask+point labels under pseudo_labels_mask_point_binary/epoch1.')
+    parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Root used by SAMTrainHelper; point labels are saved under pseudo_labels_binary/epoch1, mask-only labels under pseudo_labels_mask_binary/epoch1, and mask+point labels under pseudo_labels_mask_point_binary/epoch1.')
     parser.add_argument('--pseudo-root', default='', help='Existing or generated pseudo-label directory used for stage-2 training.')
     parser.add_argument('--ccam-hith', default=0.55, type=float, help='High threshold for CCAM foreground prompt.')
     parser.add_argument('--ccam-loth', default=0.15, type=float, help='Low threshold for CCAM background mask.')

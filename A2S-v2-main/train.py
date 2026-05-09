@@ -75,7 +75,7 @@ def build_sam_helper(config, save_root):
         from sam_helper_bf import SAMTrainHelper
 
         if config.get('sam_affinity_use_mask_prompt', False):
-            print('Using legacy SAM point prompts plus positive mask prompts from sam_helper_bf.py.')
+            print('Using legacy SAM point prompts, positive mask prompts, and point+mask prompts from sam_helper_bf.py.')
         else:
             print('Using legacy SAM point prompts from sam_helper_bf.py.')
         return SAMTrainHelper(
@@ -87,8 +87,8 @@ def build_sam_helper(config, save_root):
             score_thresh=config.get('sam_score_thresh', 0.60),
             heat_iou_thresh=config.get('sam_heat_iou_thresh', 0.10),
             large_target_heat_iou_thresh=DEFAULT_SAM_LARGE_TARGET_HEAT_IOU_THRESH,
-            bg_iou_thresh=DEFAULT_SAM_BG_IOU_THRESH,
-            large_target_bg_iou_thresh=DEFAULT_SAM_LARGE_TARGET_BG_IOU_THRESH,
+            bg_iou_thresh=config.get('sam_bg_iou_thresh', DEFAULT_SAM_BG_IOU_THRESH),
+            large_target_bg_iou_thresh=config.get('sam_large_target_bg_iou_thresh', DEFAULT_SAM_LARGE_TARGET_BG_IOU_THRESH),
             large_area_thresh=config.get('sam_large_area_thresh', 0.06),
             large_uncertain_area_thresh=DEFAULT_SAM_LARGE_UNCERTAIN_AREA_THRESH,
             rule_a_heat_iou_thresh=DEFAULT_SAM_RULE_A_HEAT_IOU_THRESH,
@@ -115,8 +115,8 @@ def build_sam_helper(config, save_root):
         score_thresh=config.get('sam_score_thresh', 0.60),
         heat_iou_thresh=config.get('sam_heat_iou_thresh', 0.10),
         large_target_heat_iou_thresh=DEFAULT_SAM_LARGE_TARGET_HEAT_IOU_THRESH,
-        bg_iou_thresh=DEFAULT_SAM_BG_IOU_THRESH,
-        large_target_bg_iou_thresh=DEFAULT_SAM_LARGE_TARGET_BG_IOU_THRESH,
+        bg_iou_thresh=config.get('sam_bg_iou_thresh', DEFAULT_SAM_BG_IOU_THRESH),
+        large_target_bg_iou_thresh=config.get('sam_large_target_bg_iou_thresh', DEFAULT_SAM_LARGE_TARGET_BG_IOU_THRESH),
         large_area_thresh=config.get('sam_large_area_thresh', 0.06),
         large_uncertain_area_thresh=DEFAULT_SAM_LARGE_UNCERTAIN_AREA_THRESH,
         resize_short_edge=config.get('sam_resize_short_edge', 640),
