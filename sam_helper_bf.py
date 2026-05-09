@@ -622,7 +622,7 @@ class SAMTrainHelper:
         self.mask_prob_threshold = float(1.0 / (1.0 + np.exp(-self.mask_logit_threshold)))
         self.failed_names: Dict[int, List[str]] = {}
         if self.use_mask_prompt:
-            print("Saving legacy point-only pseudo labels and point+mask pseudo labels.")
+            print("Saving legacy point-only, mask-only, and point+mask pseudo labels.")
 
     def _make_out_dir(self, prefix: str, epoch: int) -> str:
         out_dir = os.path.join(self.save_root, prefix, f"epoch{epoch + 1}")
@@ -733,6 +733,38 @@ class SAMTrainHelper:
                         logits=np.asarray(logit_mask, dtype=np.float32),
                     )
                 )
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        return candidates
+
+    def _run_sam_mask_prompt(
+        self,
+        image_rgb: np.ndarray,
+        seed_mask: np.ndarray,
+        set_image: bool = True,
+    ) -> List[SAMCandidate]:
+        if int(_ensure_binary_mask(seed_mask).sum()) <= 0:
+            return []
+
+        if set_image:
+            self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb)))
+        mask_input = self._build_positive_mask_prompt(seed_mask)
+        mask_logits, scores, _ = self.predictor.predict(
+            mask_input=mask_input,
+            multimask_output=self.multimask_output,
+            return_logits=True,
+        )
+
+        candidates: List[SAMCandidate] = []
+        for logit_mask, score in zip(np.asarray(mask_logits), np.asarray(scores).reshape(-1)):
+            prob_map = _logits_to_prob_map(logit_mask)
+            candidates.append(
+                SAMCandidate(
+                    mask=_threshold_prob_map(prob_map, self.mask_prob_threshold),
+                    score=float(score),
+                    point_idx=-2,
+                    logits=np.asarray(logit_mask, dtype=np.float32),
+                )
+            )
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates
 
@@ -1009,6 +1041,21 @@ class SAMTrainHelper:
         overlay_orig = SAMHelper.draw_points(overlay_orig, points_xy)
         _write_rgb(os.path.join(out_dir, f"{stem}.png"), overlay_orig)
 
+    def _save_mask_seg_overlay(
+        self,
+        image_rgb: np.ndarray,
+        mask_orig: Optional[np.ndarray],
+        filename: str,
+        epoch: int,
+        prefix: str = "mask_sam_seg",
+    ) -> None:
+        if mask_orig is None:
+            return
+        out_dir = self._make_out_dir(prefix, epoch)
+        stem = os.path.splitext(filename)[0]
+        overlay_orig = SAMHelper.draw_mask_overlay(image_rgb, mask_orig)
+        _write_rgb(os.path.join(out_dir, f"{stem}.png"), overlay_orig)
+
     def _save_per_point_candidates(
         self,
         image_rgb: np.ndarray,
@@ -1039,22 +1086,35 @@ class SAMTrainHelper:
         for output_prefix in output_prefixes:
             out_dir = self._make_out_dir(output_prefix, epoch)
             for point_idx, cand_list in candidates_by_point.items():
-                prompt_tag = "box" if point_idx < 0 else f"{point_idx + 1}"
+                if point_idx == -2:
+                    prompt_tag = "mask"
+                elif point_idx < 0:
+                    prompt_tag = "box"
+                else:
+                    prompt_tag = f"{point_idx + 1}"
                 point_dir = os.path.join(out_dir, f"{stem}_{prompt_tag}")
                 os.makedirs(point_dir, exist_ok=True)
 
                 for cand_idx, candidate in enumerate(cand_list, start=1):
                     mask_orig = candidate.mask_orig if candidate.mask_orig is not None else _resize_mask(candidate.mask, heat_iou_mask.shape)
                     overlay = SAMHelper.draw_mask_overlay(image_rgb, mask_orig)
-                    if point_idx < 0 and box_xyxy is not None:
+                    if point_idx == -2:
+                        pass
+                    elif point_idx < 0 and box_xyxy is not None:
                         overlay = SAMHelper.draw_box(overlay, box_xyxy)
                     elif point_idx < len(points_xy):
                         overlay = SAMHelper.draw_points(
                             overlay,
                             np.array([points_xy[point_idx]], dtype=np.float32),
                         )
+                    if point_idx == -2:
+                        save_prompt_tag = "mask"
+                    elif point_idx < 0:
+                        save_prompt_tag = "box"
+                    else:
+                        save_prompt_tag = f"p{point_idx + 1}"
                     save_name = (
-                        f"{stem}_{'box' if point_idx < 0 else f'p{point_idx + 1}'}_c{cand_idx}"
+                        f"{stem}_{save_prompt_tag}_c{cand_idx}"
                         f"_samiou{candidate.score:.2f}"
                         f"_heat_iou{candidate.heat_iou:.2f}"
                         f"_bg_iou{candidate.bg_iou:.2f}"
@@ -1082,7 +1142,9 @@ class SAMTrainHelper:
         for candidate in candidates:
             mask_orig = candidate.mask_orig if candidate.mask_orig is not None else candidate.mask
             overlay = SAMHelper.draw_mask_overlay(image_rgb, mask_orig)
-            if candidate.point_idx < 0 and box_xyxy is not None:
+            if candidate.point_idx == -2:
+                prompt_tag = "mask"
+            elif candidate.point_idx < 0 and box_xyxy is not None:
                 overlay = SAMHelper.draw_box(overlay, box_xyxy)
                 prompt_tag = "box"
             else:
@@ -1155,6 +1217,192 @@ class SAMTrainHelper:
 
         cv2.imwrite(os.path.join(out_dir, f"{stem}.png"), map_u8)
 
+    def _save_mask_only_outputs(
+        self,
+        image_rgb: np.ndarray,
+        raw_candidates: List[SAMCandidate],
+        box_xyxy: Optional[np.ndarray],
+        heat_iou_mask: np.ndarray,
+        bg_mask: np.ndarray,
+        uncertain_area_ratio: float,
+        filename: str,
+        sample_meta: Optional[Dict[str, object]],
+        sample_idx: int,
+        epoch: int,
+        fallback_mask: np.ndarray,
+        heat_iou_thresh: float,
+        bg_iou_thresh: float,
+    ) -> None:
+        mask_candidates_by_point = self._prepare_candidates_by_point(raw_candidates, heat_iou_mask, bg_mask)
+        valid_mask_candidates_by_point = self._get_valid_candidates_by_point(
+            mask_candidates_by_point,
+            heat_iou_thresh=heat_iou_thresh,
+            bg_iou_thresh=bg_iou_thresh,
+        )
+        mask_kept_candidates = self._select_best_candidates(valid_mask_candidates_by_point)
+        mask_rule_a_candidates = self._select_rule_a_candidates(valid_mask_candidates_by_point)
+        mask_rule_b_candidates = self._select_rule_b_candidates(valid_mask_candidates_by_point)
+        mask_rule_ab_candidates = self._select_rule_ab_candidates(valid_mask_candidates_by_point)
+
+        mask_final_prob = self._merge_candidate_prob_maps(mask_kept_candidates, fallback_mask)
+        mask_rule_a_prob = self._merge_candidate_prob_maps(mask_rule_a_candidates, fallback_mask)
+        mask_rule_b_prob = self._merge_candidate_prob_maps(mask_rule_b_candidates, fallback_mask)
+        mask_rule_ab_prob = self._merge_candidate_prob_maps(mask_rule_ab_candidates, fallback_mask)
+
+        mask_final_mask = _threshold_prob_map(mask_final_prob, self.mask_prob_threshold)
+        mask_rule_a_mask = _threshold_prob_map(mask_rule_a_prob, self.mask_prob_threshold)
+        mask_rule_b_mask = _threshold_prob_map(mask_rule_b_prob, self.mask_prob_threshold)
+        mask_rule_ab_mask = _threshold_prob_map(mask_rule_ab_prob, self.mask_prob_threshold)
+
+        self._save_mask_seg_overlay(
+            image_rgb,
+            mask_final_mask,
+            filename,
+            epoch,
+            prefix="mask_sam_seg",
+        )
+        self._save_mask_seg_overlay(
+            image_rgb,
+            mask_rule_a_mask,
+            filename,
+            epoch,
+            prefix="mask_sam_seg_rule_a",
+        )
+        self._save_mask_seg_overlay(
+            image_rgb,
+            mask_rule_b_mask,
+            filename,
+            epoch,
+            prefix="mask_sam_seg_rule_b",
+        )
+        self._save_mask_seg_overlay(
+            image_rgb,
+            mask_rule_ab_mask,
+            filename,
+            epoch,
+            prefix="mask_sam_seg_rule_ab",
+        )
+        self._save_per_point_candidates(
+            image_rgb,
+            raw_candidates,
+            np.zeros((0, 2), dtype=np.float32),
+            box_xyxy,
+            heat_iou_mask,
+            bg_mask,
+            uncertain_area_ratio,
+            filename,
+            epoch,
+            output_prefixes=["mask_candidates"],
+        )
+        self._save_pseudo_label_grayscale(
+            mask_final_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask",
+        )
+        self._save_pseudo_label_grayscale(
+            mask_rule_a_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask_rule_a",
+        )
+        self._save_pseudo_label_grayscale(
+            mask_rule_b_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask_rule_b",
+        )
+        self._save_pseudo_label_grayscale(
+            mask_rule_ab_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask_rule_ab",
+        )
+        self._save_pseudo_label_binary(
+            image_rgb,
+            mask_final_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask_binary",
+        )
+        self._save_pseudo_label_binary(
+            image_rgb,
+            mask_rule_a_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask_rule_a_binary",
+        )
+        self._save_pseudo_label_binary(
+            image_rgb,
+            mask_rule_b_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask_rule_b_binary",
+        )
+        self._save_pseudo_label_binary(
+            image_rgb,
+            mask_rule_ab_prob,
+            filename,
+            sample_meta,
+            sample_idx,
+            epoch,
+            prefix="pseudo_labels_mask_rule_ab_binary",
+        )
+        self._save_final_candidates(
+            image_rgb,
+            mask_kept_candidates,
+            np.zeros((0, 2), dtype=np.float32),
+            None,
+            uncertain_area_ratio,
+            filename,
+            epoch,
+            prefix="sam_mask_final_candidates",
+        )
+        self._save_final_candidates(
+            image_rgb,
+            mask_rule_a_candidates,
+            np.zeros((0, 2), dtype=np.float32),
+            None,
+            uncertain_area_ratio,
+            filename,
+            epoch,
+            prefix="sam_mask_final_candidates_rule_a",
+        )
+        self._save_final_candidates(
+            image_rgb,
+            mask_rule_b_candidates,
+            np.zeros((0, 2), dtype=np.float32),
+            None,
+            uncertain_area_ratio,
+            filename,
+            epoch,
+            prefix="sam_mask_final_candidates_rule_b",
+        )
+        self._save_final_candidates(
+            image_rgb,
+            mask_rule_ab_candidates,
+            np.zeros((0, 2), dtype=np.float32),
+            None,
+            uncertain_area_ratio,
+            filename,
+            epoch,
+            prefix="sam_mask_final_candidates_rule_ab",
+        )
+
     def _record_failure(self, filename: str, epoch: int) -> None:
         self.failed_names.setdefault(epoch, []).append(filename)
 
@@ -1204,6 +1452,7 @@ class SAMTrainHelper:
             fallback_mask = prompt_mask.copy()
             box_raw_candidates: List[SAMCandidate] = []
             point_candidate_prefixes = ["point_candidates"]
+            mask_only_raw_candidates: List[SAMCandidate] = []
             mask_prompt_raw_candidates: List[SAMCandidate] = []
             if fg_area_ratio < self.small_fg_box_thresh:
                 box_xyxy = _mask_to_box(prompt_mask)
@@ -1249,6 +1498,11 @@ class SAMTrainHelper:
             self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb_aug)))
             raw_candidates = self._run_sam_single(image_rgb_aug, points_xy_aug, set_image=False)
             if self.use_mask_prompt:
+                mask_only_raw_candidates = self._run_sam_mask_prompt(
+                    image_rgb_aug,
+                    prompt_mask,
+                    set_image=False,
+                )
                 mask_prompt_raw_candidates = self._run_sam_single_with_mask_prompt(
                     image_rgb_aug,
                     points_xy_aug,
@@ -1390,6 +1644,21 @@ class SAMTrainHelper:
                 epoch,
             )
             if self.use_mask_prompt:
+                self._save_mask_only_outputs(
+                    image_rgb,
+                    mask_only_raw_candidates,
+                    None,
+                    candidate_heat_iou_ref_mask,
+                    bg_mask,
+                    uncertain_area_ratio,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    fallback_mask,
+                    heat_iou_thresh,
+                    bg_iou_thresh,
+                )
                 mask_candidates_by_point = self._prepare_candidates_by_point(
                     mask_prompt_raw_candidates,
                     candidate_heat_iou_ref_mask,
