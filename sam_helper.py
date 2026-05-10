@@ -835,7 +835,7 @@ class SAMTrainHelper:
             if self.affinity_use_mask_prompt:
                 print(
                     "Saving affinity point-only, instance-mask+point, "
-                    "and whole-mask+point pseudo labels."
+                    "whole-mask+group-point, and whole-mask+all-point pseudo labels."
                 )
 
     def _make_out_dir(self, prefix: str, epoch: int) -> str:
@@ -1895,6 +1895,7 @@ class SAMTrainHelper:
             point_candidate_prefixes = ["point_candidates"]
             instance_mask_prompt_raw_candidates: List[SAMCandidate] = []
             whole_mask_prompt_raw_candidates: List[SAMCandidate] = []
+            all_points_whole_mask_prompt_raw_candidates: List[SAMCandidate] = []
             if self.use_affinity_split:
                 candidate_metric_heat_iou_mask = prompt_mask.copy()
                 candidate_fg_iou_masks_by_point = {}
@@ -1959,6 +1960,15 @@ class SAMTrainHelper:
                     self._record_failure(sample_name, epoch)
                     continue
                 points_xy = np.concatenate(all_points, axis=0).astype(np.float32)
+                if self.affinity_use_mask_prompt:
+                    points_xy_aug = _scale_points(points_xy, prompt_mask.shape, aug_hw)
+                    all_points_whole_mask_prompt_raw_candidates = self._run_sam_multi_positive_with_mask_prompt(
+                        image_rgb_aug,
+                        points_xy_aug,
+                        prompt_mask,
+                        point_idx=0,
+                        set_image=False,
+                    )
                 fallback_mask = prompt_mask.copy()
                 self._save_affinity_split_result(
                     image_rgb,
@@ -2235,6 +2245,28 @@ class SAMTrainHelper:
                     candidate_prefix="whole_mask_point_candidates",
                     pseudo_prefix="pseudo_labels_whole_mask_point",
                     final_candidates_prefix="sam_whole_mask_point_final_candidates",
+                )
+                self._save_mask_prompt_outputs(
+                    image_rgb,
+                    all_points_whole_mask_prompt_raw_candidates,
+                    points_xy,
+                    box_xyxy,
+                    fallback_mask,
+                    candidate_heat_iou_ref_mask,
+                    full_background_mask,
+                    candidate_metric_heat_iou_mask,
+                    {0: prompt_mask},
+                    heat_iou_thresh,
+                    bg_iou_thresh,
+                    uncertain_area_ratio,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    seg_prefix="whole_mask_all_points_sam_seg",
+                    candidate_prefix="whole_mask_all_points_candidates",
+                    pseudo_prefix="pseudo_labels_whole_mask_all_points",
+                    final_candidates_prefix="sam_whole_mask_all_points_final_candidates",
                 )
 
 

@@ -102,7 +102,7 @@ def build_sam_helper(config, save_root):
     from sam_helper import SAMTrainHelper
 
     if config.get('sam_affinity_use_mask_prompt', False):
-        print('Using affinity SAM point prompts plus instance-mask and whole-mask prompts from sam_helper.py.')
+        print('Using affinity SAM point prompts plus three mask+point prompt variants from sam_helper.py.')
     else:
         print('Using affinity SAM point prompts from sam_helper.py.')
 
