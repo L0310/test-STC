@@ -761,6 +761,7 @@ class SAMTrainHelper:
         affinity_ncut_threshold: float = 0.10,
         affinity_max_recursion_depth: int = 8,
         affinity_use_mask_prompt: bool = False,
+        save_prefixes: Optional[List[str]] = None,
         dino_weight: str = "",
         dino_model: str = "dinov2_vitl14",
         dino_repo: str = "",
@@ -809,6 +810,7 @@ class SAMTrainHelper:
         self.affinity_ncut_threshold = float(max(0.0, affinity_ncut_threshold))
         self.affinity_max_recursion_depth = int(max(1, affinity_max_recursion_depth))
         self.affinity_use_mask_prompt = bool(affinity_use_mask_prompt)
+        self.save_prefixes = None if save_prefixes is None else set(str(prefix) for prefix in save_prefixes)
         self.dino_weight = str(dino_weight or "").strip()
         self.dino_model = str(dino_model or "dinov2_vitl14").strip() or "dinov2_vitl14"
         self.dino_repo = str(dino_repo or "").strip()
@@ -833,12 +835,25 @@ class SAMTrainHelper:
             if self.dino_weight:
                 print("DINO semantic affinity requested from {}.".format(os.path.abspath(self.dino_weight)))
             if self.affinity_use_mask_prompt:
-                print(
-                    "Saving affinity point-only, instance-mask+point, "
-                    "whole-mask+group-point, and whole-mask+all-point pseudo labels."
-                )
+                if self.save_prefixes is None:
+                    print(
+                        "Saving affinity point-only, instance-mask+point, "
+                        "and whole-mask+group-point pseudo labels."
+                    )
+                else:
+                    print("Saving compact affinity pseudo outputs: {}.".format(", ".join(sorted(self.save_prefixes))))
 
-    def _make_out_dir(self, prefix: str, epoch: int) -> str:
+    def _should_save_prefix(self, prefix: str) -> bool:
+        return self.save_prefixes is None or str(prefix) in self.save_prefixes
+
+    def _should_save_any_prefix(self, prefixes: List[str]) -> bool:
+        if self.save_prefixes is None:
+            return True
+        return any(str(prefix) in self.save_prefixes for prefix in prefixes)
+
+    def _make_out_dir(self, prefix: str, epoch: int) -> Optional[str]:
+        if not self._should_save_prefix(prefix):
+            return None
         out_dir = os.path.join(self.save_root, prefix, f"epoch{epoch + 1}")
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
@@ -1383,6 +1398,8 @@ class SAMTrainHelper:
         prefix: str = "points_attn_heatmap",
     ) -> None:
         out_dir = self._make_out_dir(prefix, epoch)
+        if out_dir is None:
+            return
         raw_dir = os.path.join(out_dir, "raw")
         os.makedirs(raw_dir, exist_ok=True)
 
@@ -1409,6 +1426,8 @@ class SAMTrainHelper:
         if mask_orig is None:
             return
         out_dir = self._make_out_dir(prefix, epoch)
+        if out_dir is None:
+            return
         stem = os.path.splitext(filename)[0]
         overlay_orig = SAMHelper.draw_mask_overlay(image_rgb, mask_orig)
         if box_xyxy is not None:
@@ -1442,11 +1461,19 @@ class SAMTrainHelper:
         overlay = SAMHelper.draw_points(overlay, points_xy)
         union_mask = _seed_masks_to_union(seed_masks, image_rgb.shape[:2])
 
-        cv2.imwrite(os.path.join(prompt_dir, f"{stem}.png"), prompt_mask.astype(np.uint8) * 255)
-        cv2.imwrite(os.path.join(union_dir, f"{stem}.png"), union_mask.astype(np.uint8) * 255)
-        _write_rgb(os.path.join(label_dir, f"{stem}.png"), label_rgb)
-        _write_rgb(os.path.join(overlay_dir, f"{stem}.png"), overlay)
-        if superpixel_label_map is not None and int((np.asarray(superpixel_label_map) > 0).sum()) > 0:
+        if prompt_dir is not None:
+            cv2.imwrite(os.path.join(prompt_dir, f"{stem}.png"), prompt_mask.astype(np.uint8) * 255)
+        if union_dir is not None:
+            cv2.imwrite(os.path.join(union_dir, f"{stem}.png"), union_mask.astype(np.uint8) * 255)
+        if label_dir is not None:
+            _write_rgb(os.path.join(label_dir, f"{stem}.png"), label_rgb)
+        if overlay_dir is not None:
+            _write_rgb(os.path.join(overlay_dir, f"{stem}.png"), overlay)
+        if (
+            superpixel_overlay_dir is not None
+            and superpixel_label_map is not None
+            and int((np.asarray(superpixel_label_map) > 0).sum()) > 0
+        ):
             superpixel_overlay = _draw_label_grid_overlay(
                 image_rgb,
                 np.asarray(superpixel_label_map, dtype=np.int32),
@@ -1513,6 +1540,8 @@ class SAMTrainHelper:
 
         for output_prefix in output_prefixes:
             out_dir = self._make_out_dir(output_prefix, epoch)
+            if out_dir is None:
+                continue
             for point_idx, cand_list in candidates_by_point.items():
                 prompt_tag = _prompt_group_tag(point_idx)
                 point_dir = os.path.join(out_dir, f"{stem}_{prompt_tag}")
@@ -1554,7 +1583,10 @@ class SAMTrainHelper:
         if not candidates:
             return
         stem = os.path.splitext(filename)[0]
-        sample_dir = os.path.join(self._make_out_dir(prefix, epoch), stem)
+        out_dir = self._make_out_dir(prefix, epoch)
+        if out_dir is None:
+            return
+        sample_dir = os.path.join(out_dir, stem)
         os.makedirs(sample_dir, exist_ok=True)
 
         if point_group_starts is None:
@@ -1607,6 +1639,8 @@ class SAMTrainHelper:
         prefix: str = "pseudo_labels",
     ) -> None:
         out_dir = self._make_out_dir(prefix, epoch)
+        if out_dir is None:
+            return
         stem = os.path.splitext(filename)[0]
         prob_map = np.clip(np.asarray(prob_map, dtype=np.float32), 0.0, 1.0)
 
@@ -1636,6 +1670,8 @@ class SAMTrainHelper:
         prefix: str = "pseudo_labels",
     ) -> None:
         out_dir = self._make_out_dir(prefix, epoch)
+        if out_dir is None:
+            return
         stem = os.path.splitext(filename)[0]
         prob_map = np.clip(np.asarray(prob_map, dtype=np.float32), 0.0, 1.0)
 
@@ -1847,6 +1883,8 @@ class SAMTrainHelper:
 
     def finalize_epoch(self, epoch: int) -> None:
         fail_dir = self._make_out_dir("sam_failures", epoch)
+        if fail_dir is None:
+            return
         log_path = os.path.join(fail_dir, "failures.txt")
         with open(log_path, "w", encoding="utf-8") as handle:
             for name in self.failed_names.get(epoch, []):
@@ -1895,7 +1933,36 @@ class SAMTrainHelper:
             point_candidate_prefixes = ["point_candidates"]
             instance_mask_prompt_raw_candidates: List[SAMCandidate] = []
             whole_mask_prompt_raw_candidates: List[SAMCandidate] = []
-            all_points_whole_mask_prompt_raw_candidates: List[SAMCandidate] = []
+            save_instance_mask_prompt = self.affinity_use_mask_prompt and self._should_save_any_prefix([
+                "mask_point_candidates",
+                "mask_point_sam_seg",
+                "mask_point_sam_seg_rule_a",
+                "mask_point_sam_seg_rule_ab",
+                "pseudo_labels_mask_point",
+                "pseudo_labels_mask_point_binary",
+                "pseudo_labels_mask_point_rule_a",
+                "pseudo_labels_mask_point_rule_a_binary",
+                "pseudo_labels_mask_point_rule_ab",
+                "pseudo_labels_mask_point_rule_ab_binary",
+                "sam_mask_point_final_candidates",
+                "sam_mask_point_final_candidates_rule_a",
+                "sam_mask_point_final_candidates_rule_ab",
+            ])
+            save_whole_mask_prompt = self.affinity_use_mask_prompt and self._should_save_any_prefix([
+                "whole_mask_point_candidates",
+                "whole_mask_point_sam_seg",
+                "whole_mask_point_sam_seg_rule_a",
+                "whole_mask_point_sam_seg_rule_ab",
+                "pseudo_labels_whole_mask_point",
+                "pseudo_labels_whole_mask_point_binary",
+                "pseudo_labels_whole_mask_point_rule_a",
+                "pseudo_labels_whole_mask_point_rule_a_binary",
+                "pseudo_labels_whole_mask_point_rule_ab",
+                "pseudo_labels_whole_mask_point_rule_ab_binary",
+                "sam_whole_mask_point_final_candidates",
+                "sam_whole_mask_point_final_candidates_rule_a",
+                "sam_whole_mask_point_final_candidates_rule_ab",
+            ])
             if self.use_affinity_split:
                 candidate_metric_heat_iou_mask = prompt_mask.copy()
                 candidate_fg_iou_masks_by_point = {}
@@ -1936,7 +2003,7 @@ class SAMTrainHelper:
                             set_image=False,
                         )
                     )
-                    if self.affinity_use_mask_prompt:
+                    if save_instance_mask_prompt:
                         instance_mask_prompt_raw_candidates.extend(
                             self._run_sam_multi_positive_with_mask_prompt(
                                 image_rgb_aug,
@@ -1946,6 +2013,7 @@ class SAMTrainHelper:
                                 set_image=False,
                             )
                         )
+                    if save_whole_mask_prompt:
                         whole_mask_prompt_raw_candidates.extend(
                             self._run_sam_multi_positive_with_mask_prompt(
                                 image_rgb_aug,
@@ -1960,15 +2028,6 @@ class SAMTrainHelper:
                     self._record_failure(sample_name, epoch)
                     continue
                 points_xy = np.concatenate(all_points, axis=0).astype(np.float32)
-                if self.affinity_use_mask_prompt:
-                    points_xy_aug = _scale_points(points_xy, prompt_mask.shape, aug_hw)
-                    all_points_whole_mask_prompt_raw_candidates = self._run_sam_multi_positive_with_mask_prompt(
-                        image_rgb_aug,
-                        points_xy_aug,
-                        prompt_mask,
-                        point_idx=0,
-                        set_image=False,
-                    )
                 fallback_mask = prompt_mask.copy()
                 self._save_affinity_split_result(
                     image_rgb,
@@ -2201,7 +2260,7 @@ class SAMTrainHelper:
                 prefix="sam_final_candidates_rule_ab",
                 point_group_starts=sorted(candidate_fg_iou_masks_by_point.keys()) if candidate_fg_iou_masks_by_point else None,
             )
-            if self.use_affinity_split and self.affinity_use_mask_prompt:
+            if self.use_affinity_split and save_instance_mask_prompt:
                 self._save_mask_prompt_outputs(
                     image_rgb,
                     instance_mask_prompt_raw_candidates,
@@ -2224,6 +2283,7 @@ class SAMTrainHelper:
                     pseudo_prefix="pseudo_labels_mask_point",
                     final_candidates_prefix="sam_mask_point_final_candidates",
                 )
+            if self.use_affinity_split and save_whole_mask_prompt:
                 self._save_mask_prompt_outputs(
                     image_rgb,
                     whole_mask_prompt_raw_candidates,
@@ -2245,28 +2305,6 @@ class SAMTrainHelper:
                     candidate_prefix="whole_mask_point_candidates",
                     pseudo_prefix="pseudo_labels_whole_mask_point",
                     final_candidates_prefix="sam_whole_mask_point_final_candidates",
-                )
-                self._save_mask_prompt_outputs(
-                    image_rgb,
-                    all_points_whole_mask_prompt_raw_candidates,
-                    points_xy,
-                    box_xyxy,
-                    fallback_mask,
-                    candidate_heat_iou_ref_mask,
-                    full_background_mask,
-                    candidate_metric_heat_iou_mask,
-                    {0: prompt_mask},
-                    heat_iou_thresh,
-                    bg_iou_thresh,
-                    uncertain_area_ratio,
-                    sample_name,
-                    sample_meta,
-                    idx,
-                    epoch,
-                    seg_prefix="whole_mask_all_points_sam_seg",
-                    candidate_prefix="whole_mask_all_points_candidates",
-                    pseudo_prefix="pseudo_labels_whole_mask_all_points",
-                    final_candidates_prefix="sam_whole_mask_all_points_final_candidates",
                 )
 
 

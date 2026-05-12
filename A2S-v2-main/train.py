@@ -4,6 +4,7 @@ import time
 import random
 import cv2
 import importlib
+import shutil
 import numpy as np
 from math import exp
 
@@ -36,6 +37,20 @@ DEFAULT_SAM_LARGE_UNCERTAIN_AREA_THRESH = 0.30
 DEFAULT_SAM_RULE_A_HEAT_IOU_THRESH = 0.40
 DEFAULT_SAM_RULE_B_HEAT_IOU_DELTA = 0.05
 DEFAULT_SAM_SMALL_FG_BOX_THRESH = 0.04
+DEFAULT_SAM_PSEUDO_SSD_PARENT = '/tmp/xiao_ssd_data/STC-main/A2S-v2-main/pseudo'
+SAM_COMPACT_SAVE_PREFIXES = [
+    'affinity_split_overlay',
+    'affinity_superpixel_overlay',
+    'mask_point_candidates',
+    'mask_point_sam_seg',
+    'point_candidates',
+    'points_sam_seg',
+    'pseudo_labels_binary',
+    'pseudo_labels_mask_point_binary',
+    'pseudo_labels_rule_ab_binary',
+    'pseudo_labels_mask_point_rule_ab_binary',
+    'sam_failures',
+]
 CCAM_SCALES = [1.0, 0.5, 1.5]
 
 
@@ -47,9 +62,74 @@ def prepare_cornet_sam_config(config):
     if not config.get('sam_checkpoint'):
         raise ValueError('--sam-checkpoint is required when using cornet SAM pseudo-label training.')
     sam_root = config.get('sam_pseudo_root') or './pseudo/cornet_sam'
+    sam_root = os.path.abspath(sam_root)
+    sam_work_root = resolve_sam_pseudo_work_root(config, sam_root)
+    config['sam_pseudo_final_root'] = sam_root
+    config['sam_pseudo_work_root'] = sam_work_root
+    config['sam_save_prefixes'] = list(SAM_COMPACT_SAVE_PREFIXES)
     config['pseudo_root'] = os.path.join(sam_root, 'pseudo_labels_binary', 'epoch1')
     config['allow_missing_gt'] = True
-    return sam_root
+    if sam_work_root != sam_root:
+        print('SAM pseudo labels will be staged under {} and synced to {}.'.format(sam_work_root, sam_root))
+    return sam_work_root
+
+
+def resolve_sam_pseudo_work_root(config, final_root):
+    work_root = str(config.get('sam_pseudo_work_root', '') or '').strip()
+    if work_root:
+        return os.path.abspath(work_root)
+
+    ssd_parent = str(config.get('sam_pseudo_ssd_parent', '') or DEFAULT_SAM_PSEUDO_SSD_PARENT).strip()
+    if not ssd_parent:
+        return os.path.abspath(final_root)
+
+    a2s_pseudo_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pseudo'))
+    final_root = os.path.abspath(final_root)
+    try:
+        common = os.path.commonpath([a2s_pseudo_root, final_root])
+    except ValueError:
+        common = ''
+    if common == a2s_pseudo_root:
+        relative_root = os.path.relpath(final_root, a2s_pseudo_root)
+    else:
+        relative_root = os.path.basename(final_root)
+    return os.path.abspath(os.path.join(ssd_parent, relative_root))
+
+
+def reset_sam_pseudo_work_root(config):
+    work_root = config.get('sam_pseudo_work_root')
+    final_root = config.get('sam_pseudo_final_root')
+    if not work_root or os.path.abspath(work_root) == os.path.abspath(final_root):
+        return
+    if os.path.exists(work_root):
+        print('Removing stale SAM pseudo staging root: {}'.format(work_root))
+        shutil.rmtree(work_root)
+    os.makedirs(work_root, exist_ok=True)
+
+
+def sync_and_cleanup_sam_pseudo(config):
+    work_root = config.get('sam_pseudo_work_root')
+    final_root = config.get('sam_pseudo_final_root')
+    if not work_root or not final_root:
+        return
+    work_root = os.path.abspath(work_root)
+    final_root = os.path.abspath(final_root)
+    if work_root == final_root:
+        return
+
+    os.makedirs(final_root, exist_ok=True)
+    for prefix in config.get('sam_save_prefixes', SAM_COMPACT_SAVE_PREFIXES):
+        src = os.path.join(work_root, prefix)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(final_root, prefix)
+        if os.path.exists(dst):
+            shutil.rmtree(dst)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copytree(src, dst)
+    print('Synced SAM pseudo labels from {} to {}.'.format(work_root, final_root))
+    shutil.rmtree(work_root)
+    print('Removed SAM pseudo staging root: {}'.format(work_root))
 
 
 def resolve_sam_dino_weight(config):
@@ -102,7 +182,7 @@ def build_sam_helper(config, save_root):
     from sam_helper import SAMTrainHelper
 
     if config.get('sam_affinity_use_mask_prompt', False):
-        print('Using affinity SAM point prompts plus three mask+point prompt variants from sam_helper.py.')
+        print('Using affinity SAM point prompts plus selected mask+point outputs from sam_helper.py.')
     else:
         print('Using affinity SAM point prompts from sam_helper.py.')
 
@@ -126,6 +206,7 @@ def build_sam_helper(config, save_root):
         depth_root=config.get('sam_depth_root', ''),
         seed_points_per_instance=config.get('sam_seed_points_per_instance', 3),
         affinity_use_mask_prompt=config.get('sam_affinity_use_mask_prompt', False),
+        save_prefixes=config.get('sam_save_prefixes', None),
         dino_weight=resolve_sam_dino_weight(config),
         dino_model=config.get('sam_dino_model', 'dinov2_vitl14'),
         dino_repo=config.get('sam_dino_repo', ''),
@@ -359,9 +440,11 @@ def main():
         flag = run_cornet_ccam_warmup(model, train_loader, warmup_optim, config, ccam_loss_func)
         del warmup_optim
         sam_loader = make_cornet_sam_loader(config)
+        reset_sam_pseudo_work_root(config)
         sam_helper = build_sam_helper(config, sam_pseudo_save_root)
         export_cornet_sam_pseudo(model, sam_loader, config, sam_helper, flag)
         del sam_helper
+        sync_and_cleanup_sam_pseudo(config)
         if config.get('decoder_train_layer4_stride') is not None:
             set_model_layer4_stride(model, config['decoder_train_layer4_stride'])
             print('Switched cornet layer4 stride to {} for decoder training.'.format(config['decoder_train_layer4_stride']))

@@ -53,7 +53,7 @@ def get_config():
         '--sam-use-mask-prompt',
         dest='sam_affinity_use_mask_prompt',
         action='store_true',
-        help='Also save SAM results with positive mask prompts. Affinity mode saves instance-mask+group-point, whole-mask+group-point, and whole-mask+all-point results.',
+        help='Also save SAM results with positive mask prompts. Affinity mode saves instance-mask+group-point and whole-mask+group-point results.',
     )
     parser.add_argument(
         '--sam-affinity-use-mask-prompt',
@@ -61,7 +61,9 @@ def get_config():
         action='store_true',
         help='Compatibility alias for --sam-use-mask-prompt.',
     )
-    parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Root used by SAMTrainHelper; point labels are saved under pseudo_labels_binary/epoch1, affinity instance-mask+group-point labels under pseudo_labels_mask_point_binary/epoch1, whole-mask+group-point labels under pseudo_labels_whole_mask_point_binary/epoch1, and whole-mask+all-point labels under pseudo_labels_whole_mask_all_points_binary/epoch1.')
+    parser.add_argument('--sam-pseudo-root', default='./pseudo/cornet_sam', help='Final root used by cornet training after SAM pseudo labels are synced back from SSD staging.')
+    parser.add_argument('--sam-pseudo-ssd-parent', default='/tmp/xiao_ssd_data/STC-main/A2S-v2-main/pseudo', help='SSD parent directory used to stage SAM pseudo labels during warmup.')
+    parser.add_argument('--sam-pseudo-work-root', default='', help='Optional exact SSD staging root. Empty means derive it from --sam-pseudo-ssd-parent and --sam-pseudo-root.')
     parser.add_argument('--pseudo-root', default='', help='Existing or generated pseudo-label directory used for stage-2 training.')
     parser.add_argument('--ccam-hith', default=0.55, type=float, help='High threshold for CCAM foreground prompt.')
     parser.add_argument('--ccam-loth', default=0.15, type=float, help='Low threshold for CCAM background mask.')
