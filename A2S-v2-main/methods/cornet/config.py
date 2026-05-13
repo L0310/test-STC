@@ -49,6 +49,12 @@ def get_config():
     parser.add_argument('--sam-dino-pca-dim', default=64, type=int, help='PCA dimension for superpixel DINO descriptors.')
     parser.add_argument('--sam-disable-affinity-split', action='store_true', help='Compatibility alias for --sam-prompt-mode points.')
     parser.add_argument('--sam-seed-points-per-instance', default=3, type=int, help='Max positive SAM points sampled from each affinity instance.')
+    parser.add_argument('--sam-disable-neg-prompt', action='store_true', help='Disable conservative background negative points for affinity prompt comparison outputs.')
+    parser.add_argument('--sam-neg-ccam-thresh', default=0.25, type=float, help='CCAM threshold used to form connected regions for shared negative point selection.')
+    parser.add_argument('--sam-neg-bg-thresh', default=0.05, type=float, help='Maximum CAM value allowed for a negative point candidate.')
+    parser.add_argument('--sam-neg-box-expand', default=0.15, type=float, help='Expansion ratio for the CCAM connected-component box used to search negative points.')
+    parser.add_argument('--sam-neg-margin', default=8, type=int, help='Pixel margin dilated around all CCAM components and excluded from negative point candidates.')
+    parser.add_argument('--sam-neg-points-per-component', default=3, type=int, help='Maximum negative SAM points sampled from each CCAM connected component.')
     parser.add_argument(
         '--sam-use-mask-prompt',
         dest='sam_affinity_use_mask_prompt',

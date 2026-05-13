@@ -506,6 +506,16 @@ class SAMHelper:
         return image
 
     @staticmethod
+    def draw_negative_points(image_rgb: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
+        image = _ensure_uint8_rgb(image_rgb).copy()
+        if points_xy is None or np.asarray(points_xy).size == 0:
+            return image
+        for x, y in np.atleast_2d(points_xy):
+            cv2.circle(image, (int(round(x)), int(round(y))), 5, (255, 0, 0), -1)
+            cv2.circle(image, (int(round(x)), int(round(y))), 7, (255, 255, 255), 1)
+        return image
+
+    @staticmethod
     def draw_box(image_rgb: np.ndarray, box_xyxy: Optional[np.ndarray]) -> np.ndarray:
         image = _ensure_uint8_rgb(image_rgb).copy()
         if box_xyxy is None or np.asarray(box_xyxy).size != 4:
@@ -652,7 +662,26 @@ def _scale_points(points_xy: np.ndarray, src_hw: Tuple[int, int], dst_hw: Tuple[
         scaled[:, 0] *= float(dst_w) / float(src_w)
     if src_h > 0 and dst_h != src_h:
         scaled[:, 1] *= float(dst_h) / float(src_h)
+    if dst_w > 0:
+        scaled[:, 0] = np.clip(scaled[:, 0], 0.0, float(dst_w - 1))
+    if dst_h > 0:
+        scaled[:, 1] = np.clip(scaled[:, 1], 0.0, float(dst_h - 1))
     return scaled
+
+
+def _merge_prompt_points(points_by_key: Optional[Dict[int, np.ndarray]]) -> np.ndarray:
+    if not points_by_key:
+        return np.zeros((0, 2), dtype=np.float32)
+    merged: List[Tuple[float, float]] = []
+    for key in sorted(points_by_key.keys()):
+        points = np.asarray(points_by_key[key], dtype=np.float32).reshape(-1, 2)
+        for x, y in points:
+            point = (float(x), float(y))
+            if point not in merged:
+                merged.append(point)
+    if not merged:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(merged, dtype=np.float32)
 
 
 def _scale_box(box_xyxy: np.ndarray, src_hw: Tuple[int, int], dst_hw: Tuple[int, int]) -> np.ndarray:
@@ -761,6 +790,12 @@ class SAMTrainHelper:
         affinity_ncut_threshold: float = 0.10,
         affinity_max_recursion_depth: int = 8,
         affinity_use_mask_prompt: bool = False,
+        use_negative_prompt: bool = True,
+        neg_ccam_thresh: float = 0.25,
+        neg_bg_thresh: float = 0.05,
+        neg_box_expand: float = 0.15,
+        neg_margin: int = 8,
+        neg_points_per_component: int = 3,
         save_prefixes: Optional[List[str]] = None,
         dino_weight: str = "",
         dino_model: str = "dinov2_vitl14",
@@ -810,6 +845,12 @@ class SAMTrainHelper:
         self.affinity_ncut_threshold = float(max(0.0, affinity_ncut_threshold))
         self.affinity_max_recursion_depth = int(max(1, affinity_max_recursion_depth))
         self.affinity_use_mask_prompt = bool(affinity_use_mask_prompt)
+        self.use_negative_prompt = bool(use_negative_prompt)
+        self.neg_ccam_thresh = float(np.clip(neg_ccam_thresh, 0.0, 1.0))
+        self.neg_bg_thresh = float(np.clip(neg_bg_thresh, 0.0, 1.0))
+        self.neg_box_expand = float(max(0.0, neg_box_expand))
+        self.neg_margin = int(max(0, neg_margin))
+        self.neg_points_per_component = int(max(1, neg_points_per_component))
         self.save_prefixes = None if save_prefixes is None else set(str(prefix) for prefix in save_prefixes)
         self.dino_weight = str(dino_weight or "").strip()
         self.dino_model = str(dino_model or "dinov2_vitl14").strip() or "dinov2_vitl14"
@@ -850,6 +891,126 @@ class SAMTrainHelper:
         if self.save_prefixes is None:
             return True
         return any(str(prefix) in self.save_prefixes for prefix in prefixes)
+
+    @staticmethod
+    def _empty_negative_points() -> np.ndarray:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    def _build_ccam_negative_points(
+        self,
+        cam_prob: np.ndarray,
+        full_background_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[int, np.ndarray]]:
+        cam_prob = np.clip(np.asarray(cam_prob, dtype=np.float32), 0.0, 1.0)
+        full_background_mask = _ensure_binary_mask(full_background_mask)
+        if cam_prob.shape != full_background_mask.shape:
+            cam_prob = cv2.resize(
+                cam_prob,
+                full_background_mask.shape[::-1],
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+        ccam_mask = (cam_prob >= self.neg_ccam_thresh).astype(np.uint8)
+        num_labels, label_map, stats, _ = cv2.connectedComponentsWithStats(ccam_mask, connectivity=8)
+        label_map = np.asarray(label_map, dtype=np.int32)
+        negative_points_by_label: Dict[int, np.ndarray] = {}
+        if num_labels <= 1:
+            return label_map, negative_points_by_label
+
+        h, w = cam_prob.shape
+        all_ccam = (label_map > 0).astype(np.uint8)
+        if self.neg_margin > 0:
+            kernel_size = int(self.neg_margin) * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            unsafe_ccam = cv2.dilate(all_ccam, kernel, iterations=1).astype(bool)
+        else:
+            unsafe_ccam = all_ccam.astype(bool)
+
+        low_activation_bg = cam_prob < self.neg_bg_thresh
+        for label_idx in range(1, num_labels):
+            area = int(stats[label_idx, cv2.CC_STAT_AREA])
+            if area <= 0:
+                continue
+            x = int(stats[label_idx, cv2.CC_STAT_LEFT])
+            y = int(stats[label_idx, cv2.CC_STAT_TOP])
+            bw = int(stats[label_idx, cv2.CC_STAT_WIDTH])
+            bh = int(stats[label_idx, cv2.CC_STAT_HEIGHT])
+            expand_x = int(round(float(bw) * self.neg_box_expand))
+            expand_y = int(round(float(bh) * self.neg_box_expand))
+            x0 = max(0, x - expand_x)
+            y0 = max(0, y - expand_y)
+            x1 = min(w, x + bw + expand_x)
+            y1 = min(h, y + bh + expand_y)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            box_mask = np.zeros((h, w), dtype=bool)
+            box_mask[y0:y1, x0:x1] = True
+            box_low_activation = box_mask & low_activation_bg
+            neg_region = (
+                box_low_activation
+                & (full_background_mask > 0)
+                & (~unsafe_ccam)
+            )
+            if not np.any(neg_region):
+                neg_region = box_low_activation & (~unsafe_ccam)
+            if not np.any(neg_region):
+                continue
+
+            distance = cv2.distanceTransform(neg_region.astype(np.uint8), cv2.DIST_L2, 5)
+            ys, xs = np.where(neg_region)
+            if len(xs) == 0:
+                continue
+            center = np.array([x + bw / 2.0, y + bh / 2.0], dtype=np.float32)
+            coords = np.stack([xs, ys], axis=1).astype(np.float32)
+            distance_scores = distance[ys, xs].astype(np.float32)
+            if float(distance_scores.max()) <= 0.0:
+                distance_scores = np.ones_like(distance_scores, dtype=np.float32)
+            angles = np.arctan2(coords[:, 1] - center[1], coords[:, 0] - center[0])
+            order = np.argsort(-distance_scores)
+            selected: List[np.ndarray] = []
+            selected_bins: set = set()
+            for coord_idx in order:
+                bin_idx = int(np.floor((float(angles[coord_idx]) + np.pi) / (2.0 * np.pi / 8.0))) % 8
+                if bin_idx in selected_bins and len(selected_bins) < 8:
+                    continue
+                selected.append(coords[coord_idx])
+                selected_bins.add(bin_idx)
+                if len(selected) >= self.neg_points_per_component:
+                    break
+            if len(selected) < self.neg_points_per_component:
+                selected_arr = np.stack(selected, axis=0) if selected else np.zeros((0, 2), dtype=np.float32)
+                for coord_idx in order:
+                    coord = coords[coord_idx]
+                    if selected_arr.size > 0 and np.any(np.all(np.isclose(selected_arr, coord), axis=1)):
+                        continue
+                    selected.append(coord)
+                    selected_arr = np.stack(selected, axis=0)
+                    if len(selected) >= self.neg_points_per_component:
+                        break
+            negative_points_by_label[int(label_idx)] = np.stack(selected, axis=0).astype(np.float32)
+
+        return label_map, negative_points_by_label
+
+    @staticmethod
+    def _component_ccam_label(seed_mask: np.ndarray, ccam_label_map: np.ndarray) -> Optional[int]:
+        seed_mask = _ensure_binary_mask(seed_mask)
+        if int(seed_mask.sum()) <= 0 or ccam_label_map.size == 0:
+            return None
+        if seed_mask.shape != ccam_label_map.shape:
+            ccam_label_map = cv2.resize(
+                ccam_label_map.astype(np.int32),
+                seed_mask.shape[::-1],
+                interpolation=cv2.INTER_NEAREST,
+            )
+        labels = ccam_label_map[seed_mask > 0]
+        labels = labels[labels > 0]
+        if labels.size == 0:
+            return None
+        counts = np.bincount(labels.astype(np.int32))
+        if counts.size <= 1:
+            return None
+        return int(np.argmax(counts[1:]) + 1)
 
     def _make_out_dir(self, prefix: str, epoch: int) -> Optional[str]:
         if not self._should_save_prefix(prefix):
@@ -1134,6 +1295,7 @@ class SAMTrainHelper:
         self,
         image_rgb: np.ndarray,
         points_xy: np.ndarray,
+        negative_points_xy: Optional[np.ndarray] = None,
         point_idx: int = -1,
         set_image: bool = True,
     ) -> List[SAMCandidate]:
@@ -1142,9 +1304,14 @@ class SAMTrainHelper:
 
         if set_image:
             self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb)))
-        point_labels = np.ones((points_xy.shape[0],), dtype=np.int32)
+        prompt_points = points_xy.astype(np.float32)
+        point_labels = np.ones((prompt_points.shape[0],), dtype=np.int32)
+        if negative_points_xy is not None and np.asarray(negative_points_xy).size > 0:
+            neg_points = np.asarray(negative_points_xy, dtype=np.float32).reshape(-1, 2)
+            prompt_points = np.concatenate([prompt_points, neg_points], axis=0)
+            point_labels = np.concatenate([point_labels, np.zeros((neg_points.shape[0],), dtype=np.int32)], axis=0)
         mask_logits, scores, _ = self.predictor.predict(
-            point_coords=points_xy.astype(np.float32),
+            point_coords=prompt_points,
             point_labels=point_labels,
             multimask_output=self.multimask_output,
             return_logits=True,
@@ -1165,7 +1332,7 @@ class SAMTrainHelper:
         return candidates
 
     def _build_positive_mask_prompt(self, seed_mask: np.ndarray, mask_size: int = 256, positive_logit: float = 3.0) -> np.ndarray:
-        seed_mask = _ensure_binary_mask(seed_mask).astype(np.float32)
+        seed_mask = _ensure_binary_mask(seed_mask).astype(np.uint8)
         if int(seed_mask.sum()) <= 0:
             return np.zeros((1, int(mask_size), int(mask_size)), dtype=np.float32)
 
@@ -1175,11 +1342,20 @@ class SAMTrainHelper:
 
         original_h, original_w = int(original_size[0]), int(original_size[1])
         if seed_mask.shape != (original_h, original_w):
-            seed_mask = cv2.resize(seed_mask, (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+            seed_mask = cv2.resize(seed_mask, (original_w, original_h), interpolation=cv2.INTER_NEAREST)
+
+        seed_mask = _ensure_binary_mask(seed_mask)
+        distance = cv2.distanceTransform(seed_mask.astype(np.uint8), cv2.DIST_L2, 5)
+        max_distance = float(distance.max()) if distance.size > 0 else 0.0
+        if max_distance > 0.0:
+            normalized_distance = np.clip(distance / max_distance, 0.0, 1.0)
+            soft_mask = np.where(seed_mask > 0, 1.0 + (float(positive_logit) - 1.0) * normalized_distance, 0.0)
+        else:
+            soft_mask = seed_mask.astype(np.float32) * float(positive_logit)
 
         if input_size is not None:
             input_h, input_w = int(input_size[0]), int(input_size[1])
-            transformed_mask = cv2.resize(seed_mask, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
+            transformed_mask = cv2.resize(soft_mask, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
             padded_mask = np.zeros((image_size, image_size), dtype=np.float32)
             padded_mask[:input_h, :input_w] = transformed_mask
             mask_prompt = cv2.resize(
@@ -1189,11 +1365,11 @@ class SAMTrainHelper:
             )
         else:
             mask_prompt = cv2.resize(
-                seed_mask,
+                soft_mask,
                 (int(mask_size), int(mask_size)),
                 interpolation=cv2.INTER_LINEAR,
             )
-        mask_prompt = np.clip(mask_prompt, 0.0, 1.0).astype(np.float32) * float(positive_logit)
+        mask_prompt = np.clip(mask_prompt, 0.0, float(positive_logit)).astype(np.float32)
         return mask_prompt[None, :, :]
 
     def _run_sam_multi_positive_with_mask_prompt(
@@ -1201,6 +1377,7 @@ class SAMTrainHelper:
         image_rgb: np.ndarray,
         points_xy: np.ndarray,
         seed_mask: np.ndarray,
+        negative_points_xy: Optional[np.ndarray] = None,
         point_idx: int = -1,
         set_image: bool = True,
     ) -> List[SAMCandidate]:
@@ -1209,10 +1386,15 @@ class SAMTrainHelper:
 
         if set_image:
             self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb)))
-        point_labels = np.ones((points_xy.shape[0],), dtype=np.int32)
+        prompt_points = points_xy.astype(np.float32)
+        point_labels = np.ones((prompt_points.shape[0],), dtype=np.int32)
+        if negative_points_xy is not None and np.asarray(negative_points_xy).size > 0:
+            neg_points = np.asarray(negative_points_xy, dtype=np.float32).reshape(-1, 2)
+            prompt_points = np.concatenate([prompt_points, neg_points], axis=0)
+            point_labels = np.concatenate([point_labels, np.zeros((neg_points.shape[0],), dtype=np.int32)], axis=0)
         mask_input = self._build_positive_mask_prompt(seed_mask)
         mask_logits, scores, _ = self.predictor.predict(
-            point_coords=points_xy.astype(np.float32),
+            point_coords=prompt_points,
             point_labels=point_labels,
             mask_input=mask_input,
             multimask_output=self.multimask_output,
@@ -1422,6 +1604,7 @@ class SAMTrainHelper:
         filename: str,
         epoch: int,
         prefix: str = "points_sam_seg",
+        negative_points_xy: Optional[np.ndarray] = None,
     ) -> None:
         if mask_orig is None:
             return
@@ -1433,6 +1616,7 @@ class SAMTrainHelper:
         if box_xyxy is not None:
             overlay_orig = SAMHelper.draw_box(overlay_orig, box_xyxy)
         overlay_orig = SAMHelper.draw_points(overlay_orig, points_xy)
+        overlay_orig = SAMHelper.draw_negative_points(overlay_orig, negative_points_xy)
         _write_rgb(os.path.join(out_dir, f"{stem}.png"), overlay_orig)
 
     def _save_affinity_split_result(
@@ -1495,6 +1679,7 @@ class SAMTrainHelper:
         epoch: int,
         output_prefixes: Optional[List[str]] = None,
         fg_iou_masks_by_point: Optional[Dict[int, np.ndarray]] = None,
+        negative_points_by_point: Optional[Dict[int, np.ndarray]] = None,
         metric_heat_iou_mask: Optional[np.ndarray] = None,
         metric_bg_iou_mask: Optional[np.ndarray] = None,
     ) -> None:
@@ -1558,6 +1743,8 @@ class SAMTrainHelper:
                             overlay,
                             points_xy[group_start:group_end].astype(np.float32),
                         )
+                        if negative_points_by_point is not None and point_idx in negative_points_by_point:
+                            overlay = SAMHelper.draw_negative_points(overlay, negative_points_by_point[point_idx])
                     save_name = (
                         f"{stem}_{prompt_tag}_c{cand_idx}"
                         f"_samiou{candidate.score:.2f}"
@@ -1579,6 +1766,7 @@ class SAMTrainHelper:
         epoch: int,
         prefix: str = "sam_final_candidates",
         point_group_starts: Optional[List[int]] = None,
+        negative_points_by_point: Optional[Dict[int, np.ndarray]] = None,
     ) -> None:
         if not candidates:
             return
@@ -1612,6 +1800,8 @@ class SAMTrainHelper:
                 group_start, group_end = _prompt_group_bounds(candidate.point_idx)
                 if 0 <= group_start < group_end <= len(points_xy):
                     overlay = SAMHelper.draw_points(overlay, points_xy[group_start:group_end].astype(np.float32))
+                    if negative_points_by_point is not None and candidate.point_idx in negative_points_by_point:
+                        overlay = SAMHelper.draw_negative_points(overlay, negative_points_by_point[candidate.point_idx])
                     if group_end <= group_start + 1:
                         prompt_tag = f"p{group_start + 1}"
                     else:
@@ -1710,6 +1900,7 @@ class SAMTrainHelper:
         candidate_prefix: str,
         pseudo_prefix: str,
         final_candidates_prefix: str,
+        negative_points_by_point: Optional[Dict[int, np.ndarray]] = None,
     ) -> None:
         if not raw_candidates:
             return
@@ -1760,6 +1951,7 @@ class SAMTrainHelper:
             filename,
             epoch,
             prefix=seg_prefix,
+            negative_points_xy=_merge_prompt_points(negative_points_by_point),
         )
         self._save_points_seg_overlay(
             image_rgb,
@@ -1769,6 +1961,7 @@ class SAMTrainHelper:
             filename,
             epoch,
             prefix=f"{seg_prefix}_rule_a",
+            negative_points_xy=_merge_prompt_points(negative_points_by_point),
         )
         self._save_points_seg_overlay(
             image_rgb,
@@ -1778,6 +1971,7 @@ class SAMTrainHelper:
             filename,
             epoch,
             prefix=f"{seg_prefix}_rule_ab",
+            negative_points_xy=_merge_prompt_points(negative_points_by_point),
         )
         self._save_per_point_candidates(
             image_rgb,
@@ -1791,6 +1985,7 @@ class SAMTrainHelper:
             epoch,
             output_prefixes=[candidate_prefix],
             fg_iou_masks_by_point=fg_iou_masks_by_point,
+            negative_points_by_point=negative_points_by_point,
             metric_heat_iou_mask=metric_heat_iou_mask,
         )
         self._save_pseudo_label_grayscale(
@@ -1854,6 +2049,7 @@ class SAMTrainHelper:
             epoch,
             prefix=final_candidates_prefix,
             point_group_starts=point_group_starts,
+            negative_points_by_point=negative_points_by_point,
         )
         self._save_final_candidates(
             image_rgb,
@@ -1865,6 +2061,7 @@ class SAMTrainHelper:
             epoch,
             prefix=f"{final_candidates_prefix}_rule_a",
             point_group_starts=point_group_starts,
+            negative_points_by_point=negative_points_by_point,
         )
         self._save_final_candidates(
             image_rgb,
@@ -1876,6 +2073,7 @@ class SAMTrainHelper:
             epoch,
             prefix=f"{final_candidates_prefix}_rule_ab",
             point_group_starts=point_group_starts,
+            negative_points_by_point=negative_points_by_point,
         )
 
     def _record_failure(self, filename: str, epoch: int) -> None:
@@ -1931,8 +2129,26 @@ class SAMTrainHelper:
             fallback_mask = prompt_mask.copy()
             box_raw_candidates: List[SAMCandidate] = []
             point_candidate_prefixes = ["point_candidates"]
+            point_neg_raw_candidates: List[SAMCandidate] = []
             instance_mask_prompt_raw_candidates: List[SAMCandidate] = []
+            instance_mask_prompt_neg_raw_candidates: List[SAMCandidate] = []
             whole_mask_prompt_raw_candidates: List[SAMCandidate] = []
+            negative_points_by_point: Dict[int, np.ndarray] = {}
+            save_point_negative_prompt = self.use_negative_prompt and self._should_save_any_prefix([
+                "point_candidates_neg",
+                "points_sam_seg_neg",
+                "points_sam_seg_neg_rule_a",
+                "points_sam_seg_neg_rule_ab",
+                "pseudo_labels_neg",
+                "pseudo_labels_neg_binary",
+                "pseudo_labels_neg_rule_a",
+                "pseudo_labels_neg_rule_a_binary",
+                "pseudo_labels_neg_rule_ab",
+                "pseudo_labels_neg_rule_ab_binary",
+                "sam_final_candidates_neg",
+                "sam_final_candidates_neg_rule_a",
+                "sam_final_candidates_neg_rule_ab",
+            ])
             save_instance_mask_prompt = self.affinity_use_mask_prompt and self._should_save_any_prefix([
                 "mask_point_candidates",
                 "mask_point_sam_seg",
@@ -1947,6 +2163,21 @@ class SAMTrainHelper:
                 "sam_mask_point_final_candidates",
                 "sam_mask_point_final_candidates_rule_a",
                 "sam_mask_point_final_candidates_rule_ab",
+            ])
+            save_instance_mask_prompt_neg = self.use_negative_prompt and self.affinity_use_mask_prompt and self._should_save_any_prefix([
+                "mask_point_candidates_neg",
+                "mask_point_sam_seg_neg",
+                "mask_point_sam_seg_neg_rule_a",
+                "mask_point_sam_seg_neg_rule_ab",
+                "pseudo_labels_mask_point_neg",
+                "pseudo_labels_mask_point_neg_binary",
+                "pseudo_labels_mask_point_neg_rule_a",
+                "pseudo_labels_mask_point_neg_rule_a_binary",
+                "pseudo_labels_mask_point_neg_rule_ab",
+                "pseudo_labels_mask_point_neg_rule_ab_binary",
+                "sam_mask_point_final_candidates_neg",
+                "sam_mask_point_final_candidates_neg_rule_a",
+                "sam_mask_point_final_candidates_neg_rule_ab",
             ])
             save_whole_mask_prompt = self.affinity_use_mask_prompt and self._should_save_any_prefix([
                 "whole_mask_point_candidates",
@@ -1976,6 +2207,14 @@ class SAMTrainHelper:
                     self._record_failure(sample_name, epoch)
                     continue
 
+                ccam_label_map = np.zeros_like(prompt_mask, dtype=np.int32)
+                negative_points_by_ccam_label: Dict[int, np.ndarray] = {}
+                if save_point_negative_prompt or save_instance_mask_prompt_neg:
+                    ccam_label_map, negative_points_by_ccam_label = self._build_ccam_negative_points(
+                        prob_np,
+                        full_background_mask,
+                    )
+
                 self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb_aug)))
                 raw_candidates = []
                 all_points: List[np.ndarray] = []
@@ -1995,6 +2234,13 @@ class SAMTrainHelper:
                     candidate_fg_iou_masks_by_point[point_idx] = seed_mask
                     all_points.append(component_points.astype(np.float32))
                     component_points_aug = _scale_points(component_points, prompt_mask.shape, aug_hw)
+                    component_neg_points = self._empty_negative_points()
+                    if save_point_negative_prompt or save_instance_mask_prompt_neg:
+                        ccam_label = self._component_ccam_label(seed_mask, ccam_label_map)
+                        if ccam_label is not None and ccam_label in negative_points_by_ccam_label:
+                            component_neg_points = negative_points_by_ccam_label[ccam_label].astype(np.float32)
+                            negative_points_by_point[point_idx] = component_neg_points
+                    component_neg_points_aug = _scale_points(component_neg_points, prompt_mask.shape, aug_hw)
                     raw_candidates.extend(
                         self._run_sam_multi_positive(
                             image_rgb_aug,
@@ -2003,12 +2249,33 @@ class SAMTrainHelper:
                             set_image=False,
                         )
                     )
+                    if save_point_negative_prompt:
+                        point_neg_raw_candidates.extend(
+                            self._run_sam_multi_positive(
+                                image_rgb_aug,
+                                component_points_aug,
+                                negative_points_xy=component_neg_points_aug,
+                                point_idx=point_idx,
+                                set_image=False,
+                            )
+                        )
                     if save_instance_mask_prompt:
                         instance_mask_prompt_raw_candidates.extend(
                             self._run_sam_multi_positive_with_mask_prompt(
                                 image_rgb_aug,
                                 component_points_aug,
                                 seed_mask,
+                                point_idx=point_idx,
+                                set_image=False,
+                            )
+                        )
+                    if save_instance_mask_prompt_neg:
+                        instance_mask_prompt_neg_raw_candidates.extend(
+                            self._run_sam_multi_positive_with_mask_prompt(
+                                image_rgb_aug,
+                                component_points_aug,
+                                seed_mask,
+                                negative_points_xy=component_neg_points_aug,
                                 point_idx=point_idx,
                                 set_image=False,
                             )
@@ -2260,6 +2527,30 @@ class SAMTrainHelper:
                 prefix="sam_final_candidates_rule_ab",
                 point_group_starts=sorted(candidate_fg_iou_masks_by_point.keys()) if candidate_fg_iou_masks_by_point else None,
             )
+            if self.use_affinity_split and save_point_negative_prompt:
+                self._save_mask_prompt_outputs(
+                    image_rgb,
+                    point_neg_raw_candidates,
+                    points_xy,
+                    box_xyxy,
+                    fallback_mask,
+                    candidate_heat_iou_ref_mask,
+                    full_background_mask,
+                    candidate_metric_heat_iou_mask,
+                    candidate_fg_iou_masks_by_point,
+                    heat_iou_thresh,
+                    bg_iou_thresh,
+                    uncertain_area_ratio,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    seg_prefix="points_sam_seg_neg",
+                    candidate_prefix="point_candidates_neg",
+                    pseudo_prefix="pseudo_labels_neg",
+                    final_candidates_prefix="sam_final_candidates_neg",
+                    negative_points_by_point=negative_points_by_point,
+                )
             if self.use_affinity_split and save_instance_mask_prompt:
                 self._save_mask_prompt_outputs(
                     image_rgb,
@@ -2282,6 +2573,30 @@ class SAMTrainHelper:
                     candidate_prefix="mask_point_candidates",
                     pseudo_prefix="pseudo_labels_mask_point",
                     final_candidates_prefix="sam_mask_point_final_candidates",
+                )
+            if self.use_affinity_split and save_instance_mask_prompt_neg:
+                self._save_mask_prompt_outputs(
+                    image_rgb,
+                    instance_mask_prompt_neg_raw_candidates,
+                    points_xy,
+                    box_xyxy,
+                    fallback_mask,
+                    candidate_heat_iou_ref_mask,
+                    full_background_mask,
+                    candidate_metric_heat_iou_mask,
+                    candidate_fg_iou_masks_by_point,
+                    heat_iou_thresh,
+                    bg_iou_thresh,
+                    uncertain_area_ratio,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    seg_prefix="mask_point_sam_seg_neg",
+                    candidate_prefix="mask_point_candidates_neg",
+                    pseudo_prefix="pseudo_labels_mask_point_neg",
+                    final_candidates_prefix="sam_mask_point_final_candidates_neg",
+                    negative_points_by_point=negative_points_by_point,
                 )
             if self.use_affinity_split and save_whole_mask_prompt:
                 self._save_mask_prompt_outputs(

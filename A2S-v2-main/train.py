@@ -42,13 +42,21 @@ SAM_COMPACT_SAVE_PREFIXES = [
     'affinity_split_overlay',
     'affinity_superpixel_overlay',
     'mask_point_candidates',
+    'mask_point_candidates_neg',
     'mask_point_sam_seg',
+    'mask_point_sam_seg_neg',
     'point_candidates',
+    'point_candidates_neg',
     'points_sam_seg',
+    'points_sam_seg_neg',
     'pseudo_labels_binary',
+    'pseudo_labels_neg_binary',
     'pseudo_labels_mask_point_binary',
+    'pseudo_labels_mask_point_neg_binary',
     'pseudo_labels_rule_ab_binary',
+    'pseudo_labels_neg_rule_ab_binary',
     'pseudo_labels_mask_point_rule_ab_binary',
+    'pseudo_labels_mask_point_neg_rule_ab_binary',
     'sam_failures',
 ]
 CCAM_SCALES = [1.0, 0.5, 1.5]
@@ -56,6 +64,20 @@ CCAM_SCALES = [1.0, 0.5, 1.5]
 
 def use_cornet_sam_pseudo(net_name, config):
     return net_name == 'cornet' and config['stage'] > 1 and bool(config.get('use_sam_pseudo', False))
+
+
+def use_cornet_mask_point_outputs(config):
+    if config.get('sam_affinity_use_mask_prompt', False):
+        return True
+    prefixes = config.get('sam_save_prefixes', None)
+    if not prefixes:
+        return False
+    return any(
+        str(prefix).startswith('mask_point_')
+        or str(prefix).startswith('pseudo_labels_mask_point')
+        or str(prefix).startswith('sam_mask_point_')
+        for prefix in prefixes
+    )
 
 
 def prepare_cornet_sam_config(config):
@@ -181,7 +203,8 @@ def build_sam_helper(config, save_root):
 
     from sam_helper import SAMTrainHelper
 
-    if config.get('sam_affinity_use_mask_prompt', False):
+    mask_point_outputs = use_cornet_mask_point_outputs(config)
+    if mask_point_outputs:
         print('Using affinity SAM point prompts plus selected mask+point outputs from sam_helper.py.')
     else:
         print('Using affinity SAM point prompts from sam_helper.py.')
@@ -205,7 +228,13 @@ def build_sam_helper(config, save_root):
         use_affinity_split=True,
         depth_root=config.get('sam_depth_root', ''),
         seed_points_per_instance=config.get('sam_seed_points_per_instance', 3),
-        affinity_use_mask_prompt=config.get('sam_affinity_use_mask_prompt', False),
+        affinity_use_mask_prompt=mask_point_outputs,
+        use_negative_prompt=not config.get('sam_disable_neg_prompt', False),
+        neg_ccam_thresh=config.get('sam_neg_ccam_thresh', 0.25),
+        neg_bg_thresh=config.get('sam_neg_bg_thresh', 0.05),
+        neg_box_expand=config.get('sam_neg_box_expand', 0.15),
+        neg_margin=config.get('sam_neg_margin', 8),
+        neg_points_per_component=config.get('sam_neg_points_per_component', 3),
         save_prefixes=config.get('sam_save_prefixes', None),
         dino_weight=resolve_sam_dino_weight(config),
         dino_model=config.get('sam_dino_model', 'dinov2_vitl14'),
