@@ -796,6 +796,9 @@ class SAMTrainHelper:
         neg_box_expand: float = 0.15,
         neg_margin: int = 8,
         neg_points_per_component: int = 3,
+        mask_prompt_fg_logit: float = 3.0,
+        mask_prompt_bg_logit: float = -3.0,
+        mask_prompt_uncertain_dilate: int = 12,
         save_prefixes: Optional[List[str]] = None,
         dino_weight: str = "",
         dino_model: str = "dinov2_vitl14",
@@ -851,6 +854,9 @@ class SAMTrainHelper:
         self.neg_box_expand = float(max(0.0, neg_box_expand))
         self.neg_margin = int(max(0, neg_margin))
         self.neg_points_per_component = int(max(1, neg_points_per_component))
+        self.mask_prompt_fg_logit = float(mask_prompt_fg_logit)
+        self.mask_prompt_bg_logit = float(mask_prompt_bg_logit)
+        self.mask_prompt_uncertain_dilate = int(max(0, mask_prompt_uncertain_dilate))
         self.save_prefixes = None if save_prefixes is None else set(str(prefix) for prefix in save_prefixes)
         self.dino_weight = str(dino_weight or "").strip()
         self.dino_model = str(dino_model or "dinov2_vitl14").strip() or "dinov2_vitl14"
@@ -1331,7 +1337,7 @@ class SAMTrainHelper:
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates
 
-    def _build_positive_mask_prompt(self, seed_mask: np.ndarray, mask_size: int = 256, positive_logit: float = 3.0) -> np.ndarray:
+    def _build_signed_mask_prompt(self, seed_mask: np.ndarray, mask_size: int = 256) -> np.ndarray:
         seed_mask = _ensure_binary_mask(seed_mask).astype(np.uint8)
         if int(seed_mask.sum()) <= 0:
             return np.zeros((1, int(mask_size), int(mask_size)), dtype=np.float32)
@@ -1345,18 +1351,21 @@ class SAMTrainHelper:
             seed_mask = cv2.resize(seed_mask, (original_w, original_h), interpolation=cv2.INTER_NEAREST)
 
         seed_mask = _ensure_binary_mask(seed_mask)
-        distance = cv2.distanceTransform(seed_mask.astype(np.uint8), cv2.DIST_L2, 5)
-        max_distance = float(distance.max()) if distance.size > 0 else 0.0
-        if max_distance > 0.0:
-            normalized_distance = np.clip(distance / max_distance, 0.0, 1.0)
-            soft_mask = np.where(seed_mask > 0, 1.0 + (float(positive_logit) - 1.0) * normalized_distance, 0.0)
+        signed_mask = np.zeros_like(seed_mask, dtype=np.float32)
+        signed_mask[seed_mask > 0] = self.mask_prompt_fg_logit
+
+        if self.mask_prompt_uncertain_dilate > 0:
+            kernel_size = int(self.mask_prompt_uncertain_dilate) * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            uncertain_region = cv2.dilate(seed_mask, kernel, iterations=1).astype(bool)
         else:
-            soft_mask = seed_mask.astype(np.float32) * float(positive_logit)
+            uncertain_region = seed_mask.astype(bool)
+        signed_mask[~uncertain_region] = self.mask_prompt_bg_logit
 
         if input_size is not None:
             input_h, input_w = int(input_size[0]), int(input_size[1])
-            transformed_mask = cv2.resize(soft_mask, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
-            padded_mask = np.zeros((image_size, image_size), dtype=np.float32)
+            transformed_mask = cv2.resize(signed_mask, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
+            padded_mask = np.full((image_size, image_size), self.mask_prompt_bg_logit, dtype=np.float32)
             padded_mask[:input_h, :input_w] = transformed_mask
             mask_prompt = cv2.resize(
                 padded_mask,
@@ -1365,11 +1374,13 @@ class SAMTrainHelper:
             )
         else:
             mask_prompt = cv2.resize(
-                soft_mask,
+                signed_mask,
                 (int(mask_size), int(mask_size)),
                 interpolation=cv2.INTER_LINEAR,
             )
-        mask_prompt = np.clip(mask_prompt, 0.0, float(positive_logit)).astype(np.float32)
+        lower = min(self.mask_prompt_bg_logit, self.mask_prompt_fg_logit)
+        upper = max(self.mask_prompt_bg_logit, self.mask_prompt_fg_logit)
+        mask_prompt = np.clip(mask_prompt, lower, upper).astype(np.float32)
         return mask_prompt[None, :, :]
 
     def _run_sam_multi_positive_with_mask_prompt(
@@ -1392,7 +1403,7 @@ class SAMTrainHelper:
             neg_points = np.asarray(negative_points_xy, dtype=np.float32).reshape(-1, 2)
             prompt_points = np.concatenate([prompt_points, neg_points], axis=0)
             point_labels = np.concatenate([point_labels, np.zeros((neg_points.shape[0],), dtype=np.int32)], axis=0)
-        mask_input = self._build_positive_mask_prompt(seed_mask)
+        mask_input = self._build_signed_mask_prompt(seed_mask)
         mask_logits, scores, _ = self.predictor.predict(
             point_coords=prompt_points,
             point_labels=point_labels,

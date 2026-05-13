@@ -55,6 +55,9 @@ def get_config():
     parser.add_argument('--sam-neg-box-expand', default=0.15, type=float, help='Expansion ratio for the CCAM connected-component box used to search negative points.')
     parser.add_argument('--sam-neg-margin', default=8, type=int, help='Pixel margin dilated around all CCAM components and excluded from negative point candidates.')
     parser.add_argument('--sam-neg-points-per-component', default=3, type=int, help='Maximum negative SAM points sampled from each CCAM connected component.')
+    parser.add_argument('--sam-mask-prompt-fg-logit', default=3.0, type=float, help='Foreground logit used by signed SAM mask prompts.')
+    parser.add_argument('--sam-mask-prompt-bg-logit', default=-3.0, type=float, help='Confident background logit used by signed SAM mask prompts.')
+    parser.add_argument('--sam-mask-prompt-uncertain-dilate', default=12, type=int, help='Dilation radius around the prompt mask kept as zero-logit uncertain area.')
     parser.add_argument(
         '--sam-use-mask-prompt',
         dest='sam_affinity_use_mask_prompt',
