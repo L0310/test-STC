@@ -795,10 +795,12 @@ class SAMTrainHelper:
         neg_bg_thresh: float = 0.05,
         neg_box_expand: float = 0.15,
         neg_margin: int = 8,
-        neg_points_per_component: int = 3,
+        neg_points_per_component: int = 1,
         mask_prompt_fg_logit: float = 3.0,
         mask_prompt_bg_logit: float = -3.0,
         mask_prompt_uncertain_dilate: int = 12,
+        refine_missing_ratio_thresh: float = 0.25,
+        refine_missing_points: int = 3,
         save_prefixes: Optional[List[str]] = None,
         dino_weight: str = "",
         dino_model: str = "dinov2_vitl14",
@@ -857,6 +859,8 @@ class SAMTrainHelper:
         self.mask_prompt_fg_logit = float(mask_prompt_fg_logit)
         self.mask_prompt_bg_logit = float(mask_prompt_bg_logit)
         self.mask_prompt_uncertain_dilate = int(max(0, mask_prompt_uncertain_dilate))
+        self.refine_missing_ratio_thresh = float(np.clip(refine_missing_ratio_thresh, 0.0, 1.0))
+        self.refine_missing_points = int(max(0, refine_missing_points))
         self.save_prefixes = None if save_prefixes is None else set(str(prefix) for prefix in save_prefixes)
         self.dino_weight = str(dino_weight or "").strip()
         self.dino_model = str(dino_model or "dinov2_vitl14").strip() or "dinov2_vitl14"
@@ -1425,6 +1429,155 @@ class SAMTrainHelper:
             )
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates
+
+    @staticmethod
+    def _candidate_group_bounds(
+        points_xy: np.ndarray,
+        point_group_starts: List[int],
+        point_idx: int,
+    ) -> Tuple[int, int]:
+        if point_idx < 0 or point_idx >= len(points_xy):
+            return point_idx, point_idx
+        starts = sorted(int(value) for value in point_group_starts if int(value) >= 0)
+        next_starts = [start for start in starts if start > point_idx]
+        group_end = next_starts[0] if next_starts else len(points_xy)
+        group_end = max(point_idx + 1, min(group_end, len(points_xy)))
+        return point_idx, group_end
+
+    def _select_missing_positive_points(self, missing_mask: np.ndarray) -> np.ndarray:
+        missing_mask = _ensure_binary_mask(missing_mask)
+        if self.refine_missing_points <= 0 or int(missing_mask.sum()) <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        selected: List[np.ndarray] = []
+        for component in _connected_components(missing_mask):
+            if len(selected) >= self.refine_missing_points:
+                break
+            distance = cv2.distanceTransform(component.astype(np.uint8), cv2.DIST_L2, 5)
+            if float(distance.max()) <= 0.0:
+                ys, xs = np.where(component > 0)
+            else:
+                ys, xs = np.where(distance >= (float(distance.max()) - 1e-6))
+            if len(xs) == 0:
+                continue
+            coords = np.stack([xs, ys], axis=1).astype(np.float32)
+            selected.append(coords[len(coords) // 2])
+        if not selected:
+            return np.zeros((0, 2), dtype=np.float32)
+        return np.stack(selected[:self.refine_missing_points], axis=0).astype(np.float32)
+
+    def _run_point_refine_candidates(
+        self,
+        image_rgb_aug: np.ndarray,
+        source_candidates: List[SAMCandidate],
+        points_xy: np.ndarray,
+        prompt_mask: np.ndarray,
+        point_group_starts: List[int],
+        prompt_masks_by_point: Optional[Dict[int, np.ndarray]] = None,
+        negative_points_by_point: Optional[Dict[int, np.ndarray]] = None,
+        use_negative: bool = False,
+    ) -> Tuple[List[SAMCandidate], np.ndarray, Dict[int, np.ndarray], Dict[int, np.ndarray], List[Tuple[SAMCandidate, str, float]]]:
+        refined_candidates: List[SAMCandidate] = []
+        refine_points_groups: List[np.ndarray] = []
+        refine_fg_masks_by_point: Dict[int, np.ndarray] = {}
+        refine_negative_points_by_point: Dict[int, np.ndarray] = {}
+        case_records: List[Tuple[SAMCandidate, str, float]] = []
+        seen_source_ids = set()
+        prompt_mask = _ensure_binary_mask(prompt_mask)
+
+        for source_candidate in source_candidates:
+            source_id = id(source_candidate)
+            if source_id in seen_source_ids:
+                continue
+            seen_source_ids.add(source_id)
+            if source_candidate.mask_orig is None:
+                continue
+            first_mask = _ensure_binary_mask(source_candidate.mask_orig)
+            if first_mask.shape != prompt_mask.shape:
+                first_mask = _resize_mask(first_mask, prompt_mask.shape)
+            group_start, group_end = self._candidate_group_bounds(points_xy, point_group_starts, source_candidate.point_idx)
+            if not (0 <= group_start < group_end <= len(points_xy)):
+                continue
+
+            point_prompt_mask = prompt_mask
+            if prompt_masks_by_point is not None and source_candidate.point_idx in prompt_masks_by_point:
+                point_prompt_mask = _ensure_binary_mask(prompt_masks_by_point[source_candidate.point_idx])
+                if point_prompt_mask.shape != prompt_mask.shape:
+                    point_prompt_mask = _resize_mask(point_prompt_mask, prompt_mask.shape)
+            point_prompt_area = max(1, int(point_prompt_mask.sum()))
+            missing_mask = (point_prompt_mask.astype(bool) & (~first_mask.astype(bool))).astype(np.uint8)
+            missing_ratio = float(missing_mask.sum()) / float(point_prompt_area)
+            is_case_b = missing_ratio >= self.refine_missing_ratio_thresh
+            refine_seed_mask = np.logical_or(first_mask > 0, point_prompt_mask > 0).astype(np.uint8) if is_case_b else first_mask
+            refine_points = [points_xy[group_start:group_end].astype(np.float32)]
+            if is_case_b:
+                missing_points = self._select_missing_positive_points(missing_mask)
+                if missing_points.size > 0:
+                    refine_points.append(missing_points.astype(np.float32))
+            refine_points_xy = np.concatenate(refine_points, axis=0).astype(np.float32)
+            refine_point_idx = sum(group.shape[0] for group in refine_points_groups)
+            refine_points_groups.append(refine_points_xy)
+            refine_fg_masks_by_point[refine_point_idx] = refine_seed_mask
+
+            negative_points = np.zeros((0, 2), dtype=np.float32)
+            if use_negative and negative_points_by_point is not None and source_candidate.point_idx in negative_points_by_point:
+                negative_points = np.asarray(negative_points_by_point[source_candidate.point_idx], dtype=np.float32).reshape(-1, 2)
+                if negative_points.shape[0] > self.neg_points_per_component:
+                    negative_points = negative_points[:self.neg_points_per_component]
+                if negative_points.size > 0:
+                    refine_negative_points_by_point[refine_point_idx] = negative_points
+
+            refine_points_aug = _scale_points(refine_points_xy, prompt_mask.shape, image_rgb_aug.shape[:2])
+            negative_points_aug = _scale_points(negative_points, prompt_mask.shape, image_rgb_aug.shape[:2])
+            refined_candidates.extend(
+                self._run_sam_multi_positive_with_mask_prompt(
+                    image_rgb_aug,
+                    refine_points_aug,
+                    refine_seed_mask,
+                    negative_points_xy=negative_points_aug if use_negative else None,
+                    point_idx=refine_point_idx,
+                    set_image=False,
+                )
+            )
+            case_records.append((source_candidate, "b" if is_case_b else "a", missing_ratio))
+
+        if not refine_points_groups:
+            return refined_candidates, np.zeros((0, 2), dtype=np.float32), refine_fg_masks_by_point, refine_negative_points_by_point, case_records
+        refine_points_all = np.concatenate(refine_points_groups, axis=0).astype(np.float32)
+        return refined_candidates, refine_points_all, refine_fg_masks_by_point, refine_negative_points_by_point, case_records
+
+    def _save_point_refine_cases(
+        self,
+        image_rgb: np.ndarray,
+        case_records: List[Tuple[SAMCandidate, str, float]],
+        points_xy: np.ndarray,
+        point_group_starts: List[int],
+        filename: str,
+        epoch: int,
+    ) -> None:
+        if not case_records:
+            return
+        stem = os.path.splitext(filename)[0]
+        for candidate, case_name, missing_ratio in case_records:
+            out_dir = self._make_out_dir(f"point_refine_case_{case_name}", epoch)
+            if out_dir is None or candidate.mask_orig is None:
+                continue
+            overlay = SAMHelper.draw_mask_overlay(image_rgb, candidate.mask_orig)
+            group_start, group_end = self._candidate_group_bounds(points_xy, point_group_starts, candidate.point_idx)
+            if 0 <= group_start < group_end <= len(points_xy):
+                overlay = SAMHelper.draw_points(overlay, points_xy[group_start:group_end].astype(np.float32))
+                prompt_tag = f"p{group_start + 1}" if group_end <= group_start + 1 else f"p{group_start + 1}-p{group_end}"
+            else:
+                prompt_tag = f"p{candidate.point_idx + 1}"
+            save_name = (
+                f"{stem}_{prompt_tag}"
+                f"_case{case_name}"
+                f"_missing{missing_ratio:.2f}"
+                f"_samiou{candidate.score:.2f}"
+                f"_heat_iou{candidate.heat_iou:.2f}"
+                f"_bg_iou{candidate.bg_iou:.2f}.png"
+            )
+            _write_rgb(os.path.join(out_dir, save_name), overlay)
 
     def _prepare_candidate_outputs(self, candidate: SAMCandidate, target_hw: Tuple[int, int]) -> None:
         if candidate.logits is not None:
@@ -2205,6 +2358,38 @@ class SAMTrainHelper:
                 "sam_whole_mask_point_final_candidates_rule_a",
                 "sam_whole_mask_point_final_candidates_rule_ab",
             ])
+            save_point_refine = self.use_affinity_split and self._should_save_any_prefix([
+                "point_refine_candidates",
+                "point_refine_sam_seg",
+                "point_refine_sam_seg_rule_a",
+                "point_refine_sam_seg_rule_ab",
+                "point_refine_case_a",
+                "point_refine_case_b",
+                "pseudo_labels_point_refine",
+                "pseudo_labels_point_refine_binary",
+                "pseudo_labels_point_refine_rule_a",
+                "pseudo_labels_point_refine_rule_a_binary",
+                "pseudo_labels_point_refine_rule_ab",
+                "pseudo_labels_point_refine_rule_ab_binary",
+                "sam_point_refine_final_candidates",
+                "sam_point_refine_final_candidates_rule_a",
+                "sam_point_refine_final_candidates_rule_ab",
+            ])
+            save_point_refine_neg = self.use_negative_prompt and self.use_affinity_split and self._should_save_any_prefix([
+                "point_refine_candidates_neg",
+                "point_refine_sam_seg_neg",
+                "point_refine_sam_seg_neg_rule_a",
+                "point_refine_sam_seg_neg_rule_ab",
+                "pseudo_labels_point_refine_neg",
+                "pseudo_labels_point_refine_neg_binary",
+                "pseudo_labels_point_refine_neg_rule_a",
+                "pseudo_labels_point_refine_neg_rule_a_binary",
+                "pseudo_labels_point_refine_neg_rule_ab",
+                "pseudo_labels_point_refine_neg_rule_ab_binary",
+                "sam_point_refine_final_candidates_neg",
+                "sam_point_refine_final_candidates_neg_rule_a",
+                "sam_point_refine_final_candidates_neg_rule_ab",
+            ])
             if self.use_affinity_split:
                 candidate_metric_heat_iou_mask = prompt_mask.copy()
                 candidate_fg_iou_masks_by_point = {}
@@ -2538,6 +2723,107 @@ class SAMTrainHelper:
                 prefix="sam_final_candidates_rule_ab",
                 point_group_starts=sorted(candidate_fg_iou_masks_by_point.keys()) if candidate_fg_iou_masks_by_point else None,
             )
+            point_group_starts = sorted(candidate_fg_iou_masks_by_point.keys()) if candidate_fg_iou_masks_by_point else []
+            point_refine_sources = kept_candidates + rule_ab_candidates
+            point_prompt_masks_by_point: Dict[int, np.ndarray] = {}
+            if self.use_affinity_split and candidate_fg_iou_masks_by_point:
+                _, prompt_label_map, _, _ = cv2.connectedComponentsWithStats(
+                    _ensure_binary_mask(prompt_mask),
+                    connectivity=8,
+                )
+                prompt_label_map = np.asarray(prompt_label_map, dtype=np.int32)
+                for point_idx, seed_mask in candidate_fg_iou_masks_by_point.items():
+                    prompt_label = self._component_ccam_label(seed_mask, prompt_label_map)
+                    if prompt_label is not None:
+                        point_prompt_masks_by_point[int(point_idx)] = (prompt_label_map == int(prompt_label)).astype(np.uint8)
+            if self.use_affinity_split and point_refine_sources and (save_point_refine or save_point_refine_neg):
+                self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb_aug)))
+            if self.use_affinity_split and point_refine_sources and save_point_refine:
+                (
+                    point_refine_raw_candidates,
+                    point_refine_points_xy,
+                    point_refine_fg_masks_by_point,
+                    _,
+                    point_refine_case_records,
+                ) = self._run_point_refine_candidates(
+                    image_rgb_aug,
+                    point_refine_sources,
+                    points_xy,
+                    prompt_mask,
+                    point_group_starts,
+                    prompt_masks_by_point=point_prompt_masks_by_point,
+                    use_negative=False,
+                )
+                self._save_point_refine_cases(
+                    image_rgb,
+                    point_refine_case_records,
+                    points_xy,
+                    point_group_starts,
+                    sample_name,
+                    epoch,
+                )
+                self._save_mask_prompt_outputs(
+                    image_rgb,
+                    point_refine_raw_candidates,
+                    point_refine_points_xy,
+                    box_xyxy,
+                    fallback_mask,
+                    candidate_heat_iou_ref_mask,
+                    full_background_mask,
+                    candidate_metric_heat_iou_mask,
+                    point_refine_fg_masks_by_point,
+                    heat_iou_thresh,
+                    bg_iou_thresh,
+                    uncertain_area_ratio,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    seg_prefix="point_refine_sam_seg",
+                    candidate_prefix="point_refine_candidates",
+                    pseudo_prefix="pseudo_labels_point_refine",
+                    final_candidates_prefix="sam_point_refine_final_candidates",
+                )
+            if self.use_affinity_split and point_refine_sources and save_point_refine_neg:
+                (
+                    point_refine_neg_raw_candidates,
+                    point_refine_neg_points_xy,
+                    point_refine_neg_fg_masks_by_point,
+                    point_refine_negative_points_by_point,
+                    _,
+                ) = self._run_point_refine_candidates(
+                    image_rgb_aug,
+                    point_refine_sources,
+                    points_xy,
+                    prompt_mask,
+                    point_group_starts,
+                    prompt_masks_by_point=point_prompt_masks_by_point,
+                    negative_points_by_point=negative_points_by_point,
+                    use_negative=True,
+                )
+                self._save_mask_prompt_outputs(
+                    image_rgb,
+                    point_refine_neg_raw_candidates,
+                    point_refine_neg_points_xy,
+                    box_xyxy,
+                    fallback_mask,
+                    candidate_heat_iou_ref_mask,
+                    full_background_mask,
+                    candidate_metric_heat_iou_mask,
+                    point_refine_neg_fg_masks_by_point,
+                    heat_iou_thresh,
+                    bg_iou_thresh,
+                    uncertain_area_ratio,
+                    sample_name,
+                    sample_meta,
+                    idx,
+                    epoch,
+                    seg_prefix="point_refine_sam_seg_neg",
+                    candidate_prefix="point_refine_candidates_neg",
+                    pseudo_prefix="pseudo_labels_point_refine_neg",
+                    final_candidates_prefix="sam_point_refine_final_candidates_neg",
+                    negative_points_by_point=point_refine_negative_points_by_point,
+                )
             if self.use_affinity_split and save_point_negative_prompt:
                 self._save_mask_prompt_outputs(
                     image_rgb,
