@@ -611,15 +611,6 @@ def _draw_boundaries(base_gray: np.ndarray, label_map: np.ndarray) -> np.ndarray
     return canvas
 
 
-def _lab_image(rgb: Optional[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
-    if rgb is None:
-        return np.zeros((shape[0], shape[1], 3), dtype=np.float32)
-    rgb = np.asarray(rgb, dtype=np.uint8)
-    if rgb.ndim != 3 or rgb.shape[:2] != tuple(shape):
-        return np.zeros((shape[0], shape[1], 3), dtype=np.float32)
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32) / 255.0
-
-
 def _resize_rgb_if_needed(rgb: Optional[np.ndarray], target_shape: Tuple[int, int]) -> Optional[np.ndarray]:
     if rgb is None:
         return None
@@ -630,70 +621,33 @@ def _resize_rgb_if_needed(rgb: Optional[np.ndarray], target_shape: Tuple[int, in
     return cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
 
-def _build_slic_input_image(
-    depth_crop: np.ndarray,
-    rgb_crop: Optional[np.ndarray],
-    depth_scale: float,
-    input_mode: str = "rgbd",
-) -> np.ndarray:
-    depth_crop = _normalize_gray(depth_crop).astype(np.float32)
-    input_mode = str(input_mode).strip().lower()
-    if input_mode not in {"rgb", "depth", "rgbd"}:
-        input_mode = "rgbd"
-
-    if input_mode == "depth":
-        return depth_crop[..., None]
-
-    if rgb_crop is None:
-        return depth_crop[..., None]
-
-    lab_crop = _lab_image(rgb_crop, depth_crop.shape)
-    if input_mode == "rgb":
-        return lab_crop.astype(np.float32)
-
-    return np.concatenate(
-        [
-            lab_crop.astype(np.float32),
-            (float(depth_scale) * depth_crop)[..., None].astype(np.float32),
-        ],
-        axis=2,
-    )
-
-
 def _build_full_image_superpixels(
     depth: np.ndarray,
     rgb: Optional[np.ndarray],
     superpixel_count: int,
     slic_compactness: float,
     slic_sigma: float,
-    slic_depth_scale: float,
-    slic_input_mode: str = "rgbd",
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     n_segments = max(1, int(superpixel_count))
     debug_info: Dict[str, object] = {
         "requested_segments": int(n_segments),
-        "slic_input_mode": str(slic_input_mode).strip().lower() or "rgbd",
+        "slic_input_mode": "rgb",
     }
     if n_segments <= 1:
         return np.ones_like(depth, dtype=np.int32), debug_info
 
-    slic_input = _build_slic_input_image(
-        depth_crop=depth,
-        rgb_crop=rgb,
-        depth_scale=slic_depth_scale,
-        input_mode=slic_input_mode,
-    )
+    image_rgb = _resize_rgb_if_needed(rgb, depth.shape)
+    if image_rgb is None:
+        depth_rgb = np.clip(_normalize_gray(depth) * 255.0, 0.0, 255.0).astype(np.uint8)
+        image_rgb = np.repeat(depth_rgb[..., None], 3, axis=2)
+        debug_info["slic_input_mode"] = "depth_fallback_rgb"
     try:
         labels = slic(
-            slic_input,
+            image_rgb,
             n_segments=int(n_segments),
             compactness=float(slic_compactness),
             sigma=float(slic_sigma),
-            start_label=1,
-            convert2lab=False,
-            enforce_connectivity=True,
-            min_size_factor=0.4,
-            max_size_factor=3.0,
+            start_label=0,
             channel_axis=-1,
         ).astype(np.int32)
     except Exception:
@@ -705,6 +659,7 @@ def _build_full_image_superpixels(
 def _clip_full_image_superpixels_to_component(
     component_crop: np.ndarray,
     slic_labels_crop: np.ndarray,
+    depth_crop: np.ndarray,
     requested_segments: int,
     min_superpixel_area: int,
     slic_input_mode: str = "rgbd",
@@ -721,7 +676,8 @@ def _clip_full_image_superpixels_to_component(
         return label_crop, debug_info
 
     slic_labels_crop = np.asarray(slic_labels_crop, dtype=np.int32)
-    if int(slic_labels_crop.max()) <= 1:
+    unique_labels = np.unique(slic_labels_crop)
+    if unique_labels.size <= 1:
         label_crop[component_crop > 0] = 1
         debug_info["raw_superpixels"] = 1
         debug_info["kept_superpixels"] = 1
@@ -729,7 +685,7 @@ def _clip_full_image_superpixels_to_component(
 
     raw_masks: List[np.ndarray] = []
     kept_masks: List[np.ndarray] = []
-    for local_label in sorted(int(value) for value in np.unique(slic_labels_crop) if int(value) > 0):
+    for local_label in sorted(int(value) for value in unique_labels):
         masked_region = ((slic_labels_crop == local_label) & (component_crop > 0)).astype(np.uint8)
         for region_mask in _connected_components(masked_region):
             if int(region_mask.sum()) <= 0:
@@ -1239,8 +1195,6 @@ def split_depth_instances_affinity_spectral(
         superpixel_count=superpixel_count,
         slic_compactness=slic_compactness,
         slic_sigma=slic_sigma,
-        slic_depth_scale=slic_depth_scale,
-        slic_input_mode=slic_input_mode,
     )
     label_map = np.zeros_like(support, dtype=np.int32)
     superpixel_label_map = np.zeros_like(support, dtype=np.int32)
@@ -1260,7 +1214,6 @@ def split_depth_instances_affinity_spectral(
         component_crop = component[crop_slice]
         depth_crop = np.asarray(depth_smooth, dtype=np.float32)[crop_slice]
         edge_crop = np.asarray(depth_edge, dtype=np.float32)[crop_slice]
-        rgb_crop = None if rgb is None else np.asarray(rgb, dtype=np.uint8)[crop_slice]
         appearance_crop = None
         if appearance_map is not None and np.asarray(appearance_map).ndim == 3 and np.asarray(appearance_map).shape[:2] == support.shape:
             appearance_crop = np.asarray(appearance_map, dtype=np.float32)[crop_slice]
@@ -1268,9 +1221,10 @@ def split_depth_instances_affinity_spectral(
         superpixel_crop, superpixel_debug = _clip_full_image_superpixels_to_component(
             component_crop=component_crop,
             slic_labels_crop=full_image_superpixels[crop_slice],
+            depth_crop=depth_crop,
             requested_segments=int(full_slic_debug.get("requested_segments", superpixel_count)),
             min_superpixel_area=min_superpixel_area,
-            slic_input_mode=slic_input_mode,
+            slic_input_mode=str(full_slic_debug.get("slic_input_mode", "rgb")),
         )
         superpixel_features = _extract_superpixel_features(
             superpixel_labels=superpixel_crop,
@@ -1472,8 +1426,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-superpixel-area", default=40, type=int, help="Minimum kept superpixel area before coverage restoration.")
     parser.add_argument("--slic-compactness", default=10.0, type=float, help="Compactness used by SLIC.")
     parser.add_argument("--slic-sigma", default=1.0, type=float, help="Gaussian smoothing sigma used by SLIC.")
-    parser.add_argument("--slic-depth-scale", default=0.5, type=float, help="Relative depth-channel scale appended to Lab color before SLIC.")
-    parser.add_argument("--slic-input-mode", default="rgbd", choices=["rgb", "depth", "rgbd"], help="Input modality used by SLIC: RGB only, depth only, or concatenated RGB-D.")
+    parser.add_argument("--slic-depth-scale", default=0.5, type=float, help="Legacy compatibility option; RGB SLIC no longer uses depth channels.")
+    parser.add_argument("--slic-input-mode", default="rgb", choices=["rgb", "depth", "rgbd"], help="Legacy compatibility option; RGB SLIC is always used when RGB is available.")
     parser.add_argument("--sigma-sem", default=0.20, type=float, help="Sigma used in semantic affinity exp(-(1-cos)/sigma_sem).")
     parser.add_argument("--sigma-dep", default=0.02, type=float, help="Sigma used in depth affinity exp(-(d_i-d_j)^2/sigma_dep).")
     parser.add_argument("--sigma-spatial", default=0.12, type=float, help="Sigma used in spatial affinity exp(-dist^2/sigma_spatial). Distances are normalized by the component diagonal.")
