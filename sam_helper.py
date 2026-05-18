@@ -776,10 +776,10 @@ class SAMTrainHelper:
         seed_points_per_instance: int = 3,
         affinity_min_component_area: int = 128,
         affinity_min_instance_area: int = 64,
-        affinity_superpixel_size: int = 18,
+        affinity_superpixel_count: int = 200,
         affinity_min_superpixel_area: int = 40,
-        affinity_slic_compactness: float = 6.0,
-        affinity_slic_sigma: float = 0.0,
+        affinity_slic_compactness: float = 10.0,
+        affinity_slic_sigma: float = 1.0,
         affinity_slic_depth_scale: float = 0.5,
         affinity_sigma_sem: float = 0.20,
         affinity_sigma_dep: float = 0.02,
@@ -833,7 +833,7 @@ class SAMTrainHelper:
         self.seed_points_per_instance = max(1, int(seed_points_per_instance))
         self.affinity_min_component_area = int(max(1, affinity_min_component_area))
         self.affinity_min_instance_area = int(max(1, affinity_min_instance_area))
-        self.affinity_superpixel_size = int(max(8, affinity_superpixel_size))
+        self.affinity_superpixel_count = int(max(1, affinity_superpixel_count))
         self.affinity_min_superpixel_area = int(max(1, affinity_min_superpixel_area))
         self.affinity_slic_compactness = float(max(0.0, affinity_slic_compactness))
         self.affinity_slic_sigma = float(max(0.0, affinity_slic_sigma))
@@ -1131,6 +1131,21 @@ class SAMTrainHelper:
             [lab, (self.affinity_slic_depth_scale * depth)[..., None].astype(np.float32)],
             axis=2,
         )
+        try:
+            full_image_labels = slic(
+                slic_input,
+                n_segments=self.affinity_superpixel_count,
+                compactness=self.affinity_slic_compactness,
+                sigma=self.affinity_slic_sigma,
+                start_label=1,
+                convert2lab=False,
+                enforce_connectivity=True,
+                min_size_factor=0.4,
+                max_size_factor=3.0,
+                channel_axis=-1,
+            ).astype(np.int32)
+        except Exception:
+            return _connected_components(prompt_mask), None
 
         label_map = np.zeros_like(prompt_mask, dtype=np.int32)
         next_label = 1
@@ -1145,36 +1160,15 @@ class SAMTrainHelper:
             x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
             crop_slice = np.s_[y0:y1 + 1, x0:x1 + 1]
             component_crop = component[crop_slice]
-            slic_input_crop = slic_input[crop_slice]
-            n_segments = max(
-                1,
-                int(round(float(component_crop.size) / float(self.affinity_superpixel_size * self.affinity_superpixel_size))),
-            )
-            if n_segments <= 1:
-                label_map[component > 0] = next_label
-                next_label += 1
-                continue
-            try:
-                labels = slic(
-                    slic_input_crop,
-                    n_segments=n_segments,
-                    compactness=self.affinity_slic_compactness,
-                    sigma=self.affinity_slic_sigma,
-                    start_label=1,
-                    convert2lab=False,
-                    enforce_connectivity=True,
-                    min_size_factor=0.4,
-                    max_size_factor=3.0,
-                    channel_axis=-1,
-                ).astype(np.int32)
-            except Exception:
+            labels_crop = full_image_labels[crop_slice]
+            if int(labels_crop.max()) <= 1:
                 label_map[component > 0] = next_label
                 next_label += 1
                 continue
 
             accepted = 0
-            for local_label in sorted(int(value) for value in np.unique(labels) if int(value) > 0):
-                masked_region = ((labels == local_label) & (component_crop > 0)).astype(np.uint8)
+            for local_label in sorted(int(value) for value in np.unique(labels_crop) if int(value) > 0):
+                masked_region = ((labels_crop == local_label) & (component_crop > 0)).astype(np.uint8)
                 for region in _connected_components(masked_region):
                     region = _filter_components(region, min_area=self.affinity_min_superpixel_area)
                     if int(region.sum()) < self.affinity_min_instance_area:
@@ -1218,7 +1212,7 @@ class SAMTrainHelper:
                 bilateral_d=7,
                 bilateral_sigma_color=25.0,
                 bilateral_sigma_space=25.0,
-                superpixel_size=self.affinity_superpixel_size,
+                superpixel_count=self.affinity_superpixel_count,
                 min_superpixel_area=self.affinity_min_superpixel_area,
                 slic_compactness=self.affinity_slic_compactness,
                 slic_sigma=self.affinity_slic_sigma,

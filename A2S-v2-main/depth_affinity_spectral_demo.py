@@ -660,47 +660,31 @@ def _build_slic_input_image(
     )
 
 
-def _oversegment_component(
-    component_crop: np.ndarray,
-    depth_crop: np.ndarray,
-    rgb_crop: Optional[np.ndarray],
-    superpixel_size: int,
-    min_superpixel_area: int,
+def _build_full_image_superpixels(
+    depth: np.ndarray,
+    rgb: Optional[np.ndarray],
+    superpixel_count: int,
     slic_compactness: float,
     slic_sigma: float,
     slic_depth_scale: float,
     slic_input_mode: str = "rgbd",
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    component_crop = (np.asarray(component_crop) > 0).astype(np.uint8)
-    label_crop = np.zeros_like(component_crop, dtype=np.int32)
+    n_segments = max(1, int(superpixel_count))
     debug_info: Dict[str, object] = {
-        "requested_segments": 0,
-        "raw_superpixels": 0,
-        "kept_superpixels": 0,
+        "requested_segments": int(n_segments),
         "slic_input_mode": str(slic_input_mode).strip().lower() or "rgbd",
     }
-    if int(component_crop.sum()) <= 0:
-        return label_crop, debug_info
-
-    component_area = int(component_crop.sum())
-    slic_area = int(component_crop.size)
-    approx_size = max(8, int(superpixel_size))
-    n_segments = max(1, int(round(float(slic_area) / float(approx_size * approx_size))))
-    debug_info["requested_segments"] = int(n_segments)
     if n_segments <= 1:
-        label_crop[component_crop > 0] = 1
-        debug_info["raw_superpixels"] = 1
-        debug_info["kept_superpixels"] = 1
-        return label_crop, debug_info
+        return np.ones_like(depth, dtype=np.int32), debug_info
 
     slic_input = _build_slic_input_image(
-        depth_crop=depth_crop,
-        rgb_crop=rgb_crop,
+        depth_crop=depth,
+        rgb_crop=rgb,
         depth_scale=slic_depth_scale,
         input_mode=slic_input_mode,
     )
     try:
-        slic_labels = slic(
+        labels = slic(
             slic_input,
             n_segments=int(n_segments),
             compactness=float(slic_compactness),
@@ -713,16 +697,40 @@ def _oversegment_component(
             channel_axis=-1,
         ).astype(np.int32)
     except Exception:
+        labels = np.ones_like(depth, dtype=np.int32)
+        debug_info["slic_error"] = True
+    return labels, debug_info
+
+
+def _clip_full_image_superpixels_to_component(
+    component_crop: np.ndarray,
+    slic_labels_crop: np.ndarray,
+    requested_segments: int,
+    min_superpixel_area: int,
+    slic_input_mode: str = "rgbd",
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    component_crop = (np.asarray(component_crop) > 0).astype(np.uint8)
+    label_crop = np.zeros_like(component_crop, dtype=np.int32)
+    debug_info: Dict[str, object] = {
+        "requested_segments": int(max(1, requested_segments)),
+        "raw_superpixels": 0,
+        "kept_superpixels": 0,
+        "slic_input_mode": str(slic_input_mode).strip().lower() or "rgbd",
+    }
+    if int(component_crop.sum()) <= 0:
+        return label_crop, debug_info
+
+    slic_labels_crop = np.asarray(slic_labels_crop, dtype=np.int32)
+    if int(slic_labels_crop.max()) <= 1:
         label_crop[component_crop > 0] = 1
         debug_info["raw_superpixels"] = 1
         debug_info["kept_superpixels"] = 1
-        debug_info["slic_error"] = True
         return label_crop, debug_info
 
     raw_masks: List[np.ndarray] = []
     kept_masks: List[np.ndarray] = []
-    for local_label in sorted(int(value) for value in np.unique(slic_labels) if int(value) > 0):
-        masked_region = ((slic_labels == local_label) & (component_crop > 0)).astype(np.uint8)
+    for local_label in sorted(int(value) for value in np.unique(slic_labels_crop) if int(value) > 0):
+        masked_region = ((slic_labels_crop == local_label) & (component_crop > 0)).astype(np.uint8)
         for region_mask in _connected_components(masked_region):
             if int(region_mask.sum()) <= 0:
                 continue
@@ -1185,7 +1193,7 @@ def split_depth_instances_affinity_spectral(
     bilateral_d: int,
     bilateral_sigma_color: float,
     bilateral_sigma_space: float,
-    superpixel_size: int,
+    superpixel_count: int,
     min_superpixel_area: int,
     slic_compactness: float,
     slic_sigma: float,
@@ -1225,6 +1233,15 @@ def split_depth_instances_affinity_spectral(
         bilateral_sigma_space=bilateral_sigma_space,
     )
     depth_edge = _compute_depth_discontinuity(depth_smooth)
+    full_image_superpixels, full_slic_debug = _build_full_image_superpixels(
+        depth=depth_smooth,
+        rgb=rgb,
+        superpixel_count=superpixel_count,
+        slic_compactness=slic_compactness,
+        slic_sigma=slic_sigma,
+        slic_depth_scale=slic_depth_scale,
+        slic_input_mode=slic_input_mode,
+    )
     label_map = np.zeros_like(support, dtype=np.int32)
     superpixel_label_map = np.zeros_like(support, dtype=np.int32)
     debug_lines: List[str] = []
@@ -1248,15 +1265,11 @@ def split_depth_instances_affinity_spectral(
         if appearance_map is not None and np.asarray(appearance_map).ndim == 3 and np.asarray(appearance_map).shape[:2] == support.shape:
             appearance_crop = np.asarray(appearance_map, dtype=np.float32)[crop_slice]
 
-        superpixel_crop, superpixel_debug = _oversegment_component(
+        superpixel_crop, superpixel_debug = _clip_full_image_superpixels_to_component(
             component_crop=component_crop,
-            depth_crop=depth_crop,
-            rgb_crop=rgb_crop,
-            superpixel_size=superpixel_size,
+            slic_labels_crop=full_image_superpixels[crop_slice],
+            requested_segments=int(full_slic_debug.get("requested_segments", superpixel_count)),
             min_superpixel_area=min_superpixel_area,
-            slic_compactness=slic_compactness,
-            slic_sigma=slic_sigma,
-            slic_depth_scale=slic_depth_scale,
             slic_input_mode=slic_input_mode,
         )
         superpixel_features = _extract_superpixel_features(
@@ -1455,10 +1468,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dino-device", default="auto", help="Device for DINO inference: auto/cpu/cuda:0 ...")
     parser.add_argument("--dino-max-side", default=700, type=int, help="Maximum long-side resolution fed into the DINO encoder. 0 means full image size.")
     parser.add_argument("--dino-pca-dim", default=64, type=int, help="Optional PCA output dimension applied to superpixel-level DINO descriptors.")
-    parser.add_argument("--superpixel-size", default=18, type=int, help="Approximate SLIC superpixel width/height inside the GT region.")
+    parser.add_argument("--superpixel-count", default=200, type=int, help="Requested SLIC superpixel count over the full image before support-mask clipping.")
     parser.add_argument("--min-superpixel-area", default=40, type=int, help="Minimum kept superpixel area before coverage restoration.")
-    parser.add_argument("--slic-compactness", default=6.0, type=float, help="Compactness used by SLIC.")
-    parser.add_argument("--slic-sigma", default=0.0, type=float, help="Gaussian smoothing sigma used by SLIC.")
+    parser.add_argument("--slic-compactness", default=10.0, type=float, help="Compactness used by SLIC.")
+    parser.add_argument("--slic-sigma", default=1.0, type=float, help="Gaussian smoothing sigma used by SLIC.")
     parser.add_argument("--slic-depth-scale", default=0.5, type=float, help="Relative depth-channel scale appended to Lab color before SLIC.")
     parser.add_argument("--slic-input-mode", default="rgbd", choices=["rgb", "depth", "rgbd"], help="Input modality used by SLIC: RGB only, depth only, or concatenated RGB-D.")
     parser.add_argument("--sigma-sem", default=0.20, type=float, help="Sigma used in semantic affinity exp(-(1-cos)/sigma_sem).")
@@ -1559,7 +1572,7 @@ def main() -> None:
             bilateral_d=args.bilateral_d,
             bilateral_sigma_color=args.bilateral_sigma_color,
             bilateral_sigma_space=args.bilateral_sigma_space,
-            superpixel_size=args.superpixel_size,
+            superpixel_count=args.superpixel_count,
             min_superpixel_area=args.min_superpixel_area,
             slic_compactness=args.slic_compactness,
             slic_sigma=args.slic_sigma,

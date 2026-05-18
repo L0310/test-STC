@@ -49,6 +49,7 @@ def get_config():
     parser.add_argument('--sam-dino-pca-dim', default=64, type=int, help='PCA dimension for superpixel DINO descriptors.')
     parser.add_argument('--sam-disable-affinity-split', action='store_true', help='Compatibility alias for --sam-prompt-mode points.')
     parser.add_argument('--sam-seed-points-per-instance', default=3, type=int, help='Max positive SAM points sampled from each affinity instance.')
+    parser.add_argument('--sam-affinity-superpixel-count', default=200, type=int, help='Requested SLIC superpixel count over the full image before CCAM-mask clipping.')
     parser.add_argument('--sam-disable-neg-prompt', action='store_true', help='Disable conservative background negative points for affinity prompt comparison outputs.')
     parser.add_argument('--sam-neg-ccam-thresh', default=0.25, type=float, help='CCAM threshold used to form connected regions for shared negative point selection.')
     parser.add_argument('--sam-neg-bg-thresh', default=0.05, type=float, help='Maximum CAM value allowed for a negative point candidate.')

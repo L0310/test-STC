@@ -248,6 +248,7 @@ def build_sam_helper(config, save_root):
         use_affinity_split=True,
         depth_root=config.get('sam_depth_root', ''),
         seed_points_per_instance=config.get('sam_seed_points_per_instance', 3),
+        affinity_superpixel_count=config.get('sam_affinity_superpixel_count', 200),
         affinity_use_mask_prompt=mask_point_outputs,
         use_negative_prompt=not config.get('sam_disable_neg_prompt', False),
         neg_ccam_thresh=config.get('sam_neg_ccam_thresh', 0.25),
