@@ -516,16 +516,6 @@ class SAMHelper:
         return image
 
     @staticmethod
-    def draw_refine_points(image_rgb: np.ndarray, points_xy: np.ndarray) -> np.ndarray:
-        image = _ensure_uint8_rgb(image_rgb).copy()
-        if points_xy is None or np.asarray(points_xy).size == 0:
-            return image
-        for x, y in np.atleast_2d(points_xy):
-            cv2.circle(image, (int(round(x)), int(round(y))), 5, (255, 165, 0), -1)
-            cv2.circle(image, (int(round(x)), int(round(y))), 7, (255, 255, 255), 1)
-        return image
-
-    @staticmethod
     def draw_box(image_rgb: np.ndarray, box_xyxy: Optional[np.ndarray]) -> np.ndarray:
         image = _ensure_uint8_rgb(image_rgb).copy()
         if box_xyxy is None or np.asarray(box_xyxy).size != 4:
@@ -807,10 +797,7 @@ class SAMTrainHelper:
         neg_margin: int = 8,
         neg_points_per_component: int = 1,
         mask_prompt_fg_logit: float = 3.0,
-        mask_prompt_bg_logit: float = -3.0,
-        mask_prompt_uncertain_dilate: int = 12,
         refine_missing_ratio_thresh: float = 0.25,
-        refine_missing_points: int = 3,
         save_prefixes: Optional[List[str]] = None,
         dino_weight: str = "",
         dino_model: str = "dinov2_vitl14",
@@ -867,10 +854,7 @@ class SAMTrainHelper:
         self.neg_margin = int(max(0, neg_margin))
         self.neg_points_per_component = int(max(1, neg_points_per_component))
         self.mask_prompt_fg_logit = float(mask_prompt_fg_logit)
-        self.mask_prompt_bg_logit = float(mask_prompt_bg_logit)
-        self.mask_prompt_uncertain_dilate = int(max(0, mask_prompt_uncertain_dilate))
         self.refine_missing_ratio_thresh = float(np.clip(refine_missing_ratio_thresh, 0.0, 1.0))
-        self.refine_missing_points = int(max(0, refine_missing_points))
         self.save_prefixes = None if save_prefixes is None else set(str(prefix) for prefix in save_prefixes)
         self.dino_weight = str(dino_weight or "").strip()
         self.dino_model = str(dino_model or "dinov2_vitl14").strip() or "dinov2_vitl14"
@@ -1157,19 +1141,26 @@ class SAMTrainHelper:
                 label_map[component > 0] = next_label
                 next_label += 1
                 continue
-            n_segments = max(1, int(round(float(area) / float(self.affinity_superpixel_size * self.affinity_superpixel_size))))
+            ys, xs = np.where(component > 0)
+            x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+            crop_slice = np.s_[y0:y1 + 1, x0:x1 + 1]
+            component_crop = component[crop_slice]
+            slic_input_crop = slic_input[crop_slice]
+            n_segments = max(
+                1,
+                int(round(float(component_crop.size) / float(self.affinity_superpixel_size * self.affinity_superpixel_size))),
+            )
             if n_segments <= 1:
                 label_map[component > 0] = next_label
                 next_label += 1
                 continue
             try:
                 labels = slic(
-                    slic_input,
+                    slic_input_crop,
                     n_segments=n_segments,
                     compactness=self.affinity_slic_compactness,
                     sigma=self.affinity_slic_sigma,
                     start_label=1,
-                    mask=(component > 0),
                     convert2lab=False,
                     enforce_connectivity=True,
                     min_size_factor=0.4,
@@ -1183,13 +1174,15 @@ class SAMTrainHelper:
 
             accepted = 0
             for local_label in sorted(int(value) for value in np.unique(labels) if int(value) > 0):
-                region = ((labels == local_label) & (component > 0)).astype(np.uint8)
-                region = _filter_components(region, min_area=self.affinity_min_superpixel_area)
-                if int(region.sum()) < self.affinity_min_instance_area:
-                    continue
-                label_map[region > 0] = next_label
-                next_label += 1
-                accepted += 1
+                masked_region = ((labels == local_label) & (component_crop > 0)).astype(np.uint8)
+                for region in _connected_components(masked_region):
+                    region = _filter_components(region, min_area=self.affinity_min_superpixel_area)
+                    if int(region.sum()) < self.affinity_min_instance_area:
+                        continue
+                    label_view = label_map[crop_slice]
+                    label_view[region > 0] = next_label
+                    next_label += 1
+                    accepted += 1
             if accepted == 0:
                 label_map[component > 0] = next_label
                 next_label += 1
@@ -1351,7 +1344,7 @@ class SAMTrainHelper:
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates
 
-    def _build_signed_mask_prompt(self, seed_mask: np.ndarray, mask_size: int = 256) -> np.ndarray:
+    def _build_soft_mask_prompt(self, seed_mask: np.ndarray, mask_size: int = 256) -> np.ndarray:
         seed_mask = _ensure_binary_mask(seed_mask).astype(np.uint8)
         if int(seed_mask.sum()) <= 0:
             return np.zeros((1, int(mask_size), int(mask_size)), dtype=np.float32)
@@ -1365,21 +1358,22 @@ class SAMTrainHelper:
             seed_mask = cv2.resize(seed_mask, (original_w, original_h), interpolation=cv2.INTER_NEAREST)
 
         seed_mask = _ensure_binary_mask(seed_mask)
-        signed_mask = np.zeros_like(seed_mask, dtype=np.float32)
-        signed_mask[seed_mask > 0] = self.mask_prompt_fg_logit
-
-        if self.mask_prompt_uncertain_dilate > 0:
-            kernel_size = int(self.mask_prompt_uncertain_dilate) * 2 + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-            uncertain_region = cv2.dilate(seed_mask, kernel, iterations=1).astype(bool)
+        distance = cv2.distanceTransform(seed_mask.astype(np.uint8), cv2.DIST_L2, 5)
+        max_distance = float(distance.max()) if distance.size > 0 else 0.0
+        if max_distance > 0.0:
+            normalized_distance = np.clip(distance / max_distance, 0.0, 1.0)
+            soft_mask = np.where(
+                seed_mask > 0,
+                1.0 + (self.mask_prompt_fg_logit - 1.0) * normalized_distance,
+                0.0,
+            )
         else:
-            uncertain_region = seed_mask.astype(bool)
-        signed_mask[~uncertain_region] = self.mask_prompt_bg_logit
+            soft_mask = seed_mask.astype(np.float32) * self.mask_prompt_fg_logit
 
         if input_size is not None:
             input_h, input_w = int(input_size[0]), int(input_size[1])
-            transformed_mask = cv2.resize(signed_mask, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
-            padded_mask = np.full((image_size, image_size), self.mask_prompt_bg_logit, dtype=np.float32)
+            transformed_mask = cv2.resize(soft_mask, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
+            padded_mask = np.zeros((image_size, image_size), dtype=np.float32)
             padded_mask[:input_h, :input_w] = transformed_mask
             mask_prompt = cv2.resize(
                 padded_mask,
@@ -1388,13 +1382,11 @@ class SAMTrainHelper:
             )
         else:
             mask_prompt = cv2.resize(
-                signed_mask,
+                soft_mask,
                 (int(mask_size), int(mask_size)),
                 interpolation=cv2.INTER_LINEAR,
             )
-        lower = min(self.mask_prompt_bg_logit, self.mask_prompt_fg_logit)
-        upper = max(self.mask_prompt_bg_logit, self.mask_prompt_fg_logit)
-        mask_prompt = np.clip(mask_prompt, lower, upper).astype(np.float32)
+        mask_prompt = np.clip(mask_prompt, 0.0, self.mask_prompt_fg_logit).astype(np.float32)
         return mask_prompt[None, :, :]
 
     def _run_sam_multi_positive_with_mask_prompt(
@@ -1417,7 +1409,7 @@ class SAMTrainHelper:
             neg_points = np.asarray(negative_points_xy, dtype=np.float32).reshape(-1, 2)
             prompt_points = np.concatenate([prompt_points, neg_points], axis=0)
             point_labels = np.concatenate([point_labels, np.zeros((neg_points.shape[0],), dtype=np.int32)], axis=0)
-        mask_input = self._build_signed_mask_prompt(seed_mask)
+        mask_input = self._build_soft_mask_prompt(seed_mask)
         mask_logits, scores, _ = self.predictor.predict(
             point_coords=prompt_points,
             point_labels=point_labels,
@@ -1453,28 +1445,6 @@ class SAMTrainHelper:
         group_end = next_starts[0] if next_starts else len(points_xy)
         group_end = max(point_idx + 1, min(group_end, len(points_xy)))
         return point_idx, group_end
-
-    def _select_missing_positive_points(self, missing_mask: np.ndarray) -> np.ndarray:
-        missing_mask = _ensure_binary_mask(missing_mask)
-        if self.refine_missing_points <= 0 or int(missing_mask.sum()) <= 0:
-            return np.zeros((0, 2), dtype=np.float32)
-
-        selected: List[np.ndarray] = []
-        for component in _connected_components(missing_mask):
-            if len(selected) >= self.refine_missing_points:
-                break
-            distance = cv2.distanceTransform(component.astype(np.uint8), cv2.DIST_L2, 5)
-            if float(distance.max()) <= 0.0:
-                ys, xs = np.where(component > 0)
-            else:
-                ys, xs = np.where(distance >= (float(distance.max()) - 1e-6))
-            if len(xs) == 0:
-                continue
-            coords = np.stack([xs, ys], axis=1).astype(np.float32)
-            selected.append(coords[len(coords) // 2])
-        if not selected:
-            return np.zeros((0, 2), dtype=np.float32)
-        return np.stack(selected[:self.refine_missing_points], axis=0).astype(np.float32)
 
     def _run_point_refine_candidates(
         self,
@@ -1519,13 +1489,8 @@ class SAMTrainHelper:
             if not (0 <= group_start < group_end <= len(points_xy)):
                 continue
 
-            refine_seed_mask = np.logical_or(first_mask > 0, prompt_mask > 0).astype(np.uint8) if is_case_b else first_mask
-            refine_points = [points_xy[group_start:group_end].astype(np.float32)]
-            if is_case_b:
-                missing_points = self._select_missing_positive_points(global_missing_mask)
-                if missing_points.size > 0:
-                    refine_points.append(missing_points.astype(np.float32))
-            refine_points_xy = np.concatenate(refine_points, axis=0).astype(np.float32)
+            refine_seed_mask = prompt_mask.copy() if is_case_b else first_mask
+            refine_points_xy = points_xy[group_start:group_end].astype(np.float32)
             refine_point_idx = sum(group.shape[0] for group in refine_points_groups)
             refine_points_groups.append(refine_points_xy)
             refine_fg_masks_by_point[refine_point_idx] = refine_seed_mask
@@ -1563,7 +1528,6 @@ class SAMTrainHelper:
         first_round_mask: np.ndarray,
         points_xy: np.ndarray,
         prompt_mask: np.ndarray,
-        missing_points_xy: np.ndarray,
         missing_ratio: float,
         filename: str,
         epoch: int,
@@ -1577,8 +1541,6 @@ class SAMTrainHelper:
         if case_name == "b":
             overlay = _seed_masks_overlay(overlay, [_ensure_binary_mask(prompt_mask)], alpha=0.35)
         overlay = SAMHelper.draw_points(overlay, points_xy)
-        if case_name == "b":
-            overlay = SAMHelper.draw_refine_points(overlay, missing_points_xy)
         save_name = f"{stem}_case{case_name}_missing{float(missing_ratio):.2f}.png"
         _write_rgb(os.path.join(out_dir, save_name), overlay)
 
@@ -2818,7 +2780,6 @@ class SAMTrainHelper:
                 & (~_ensure_binary_mask(final_mask).astype(bool))
             ).astype(np.uint8)
             point_refine_missing_ratio = float(point_refine_missing_mask.sum()) / float(max(1, int(_ensure_binary_mask(prompt_mask).sum())))
-            point_refine_missing_points = self._select_missing_positive_points(point_refine_missing_mask)
             if self.use_affinity_split and point_refine_sources and (save_point_refine or save_point_refine_neg):
                 self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb_aug)))
             if self.use_affinity_split and point_refine_sources and save_point_refine:
@@ -2843,7 +2804,6 @@ class SAMTrainHelper:
                     final_mask,
                     points_xy,
                     prompt_mask,
-                    point_refine_missing_points,
                     point_refine_missing_ratio,
                     sample_name,
                     epoch,
