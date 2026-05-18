@@ -683,8 +683,9 @@ def _oversegment_component(
         return label_crop, debug_info
 
     component_area = int(component_crop.sum())
+    slic_area = int(component_crop.size)
     approx_size = max(8, int(superpixel_size))
-    n_segments = max(1, int(round(float(component_area) / float(approx_size * approx_size))))
+    n_segments = max(1, int(round(float(slic_area) / float(approx_size * approx_size))))
     debug_info["requested_segments"] = int(n_segments)
     if n_segments <= 1:
         label_crop[component_crop > 0] = 1
@@ -705,7 +706,6 @@ def _oversegment_component(
             compactness=float(slic_compactness),
             sigma=float(slic_sigma),
             start_label=1,
-            mask=(component_crop > 0),
             convert2lab=False,
             enforce_connectivity=True,
             min_size_factor=0.4,
@@ -722,12 +722,13 @@ def _oversegment_component(
     raw_masks: List[np.ndarray] = []
     kept_masks: List[np.ndarray] = []
     for local_label in sorted(int(value) for value in np.unique(slic_labels) if int(value) > 0):
-        region_mask = ((slic_labels == local_label) & (component_crop > 0)).astype(np.uint8)
-        if int(region_mask.sum()) <= 0:
-            continue
-        raw_masks.append(region_mask)
-        if int(region_mask.sum()) >= int(min_superpixel_area):
-            kept_masks.append(region_mask)
+        masked_region = ((slic_labels == local_label) & (component_crop > 0)).astype(np.uint8)
+        for region_mask in _connected_components(masked_region):
+            if int(region_mask.sum()) <= 0:
+                continue
+            raw_masks.append(region_mask)
+            if int(region_mask.sum()) >= int(min_superpixel_area):
+                kept_masks.append(region_mask)
     debug_info["raw_superpixels"] = int(len(raw_masks)) if raw_masks else 1
     if not kept_masks:
         kept_masks = raw_masks if raw_masks else [component_crop.copy()]
@@ -1442,8 +1443,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gt-root", default=default_gt_root, help="Directory containing GT masks matched by basename.")
     parser.add_argument("--rgb-root", default=default_rgb_root, help="Optional RGB directory used for SLIC and DINO features.")
     parser.add_argument("--invert", action="store_true", help="Invert depth if near objects are darker instead of brighter.")
-    parser.add_argument("--min-component-area", default=800, type=int, help="Minimum GT-support connected-component area.")
-    parser.add_argument("--min-instance-area", default=400, type=int, help="Minimum kept instance area during recursive NCut.")
+    parser.add_argument("--min-component-area", default=128, type=int, help="Minimum GT-support connected-component area.")
+    parser.add_argument("--min-instance-area", default=64, type=int, help="Minimum kept instance area during recursive NCut.")
     parser.add_argument("--median-ksize", default=5, type=int, help="Median-blur kernel size for depth preprocessing.")
     parser.add_argument("--bilateral-d", default=7, type=int, help="Bilateral-filter pixel diameter.")
     parser.add_argument("--bilateral-sigma-color", default=25.0, type=float, help="Bilateral sigmaColor.")
@@ -1454,11 +1455,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dino-device", default="auto", help="Device for DINO inference: auto/cpu/cuda:0 ...")
     parser.add_argument("--dino-max-side", default=700, type=int, help="Maximum long-side resolution fed into the DINO encoder. 0 means full image size.")
     parser.add_argument("--dino-pca-dim", default=64, type=int, help="Optional PCA output dimension applied to superpixel-level DINO descriptors.")
-    parser.add_argument("--superpixel-size", default=24, type=int, help="Approximate SLIC superpixel width/height inside the GT region.")
-    parser.add_argument("--min-superpixel-area", default=48, type=int, help="Minimum kept superpixel area before coverage restoration.")
-    parser.add_argument("--slic-compactness", default=8.0, type=float, help="Compactness used by SLIC.")
-    parser.add_argument("--slic-sigma", default=1.0, type=float, help="Gaussian smoothing sigma used by SLIC.")
-    parser.add_argument("--slic-depth-scale", default=0.35, type=float, help="Relative depth-channel scale appended to Lab color before SLIC.")
+    parser.add_argument("--superpixel-size", default=18, type=int, help="Approximate SLIC superpixel width/height inside the GT region.")
+    parser.add_argument("--min-superpixel-area", default=40, type=int, help="Minimum kept superpixel area before coverage restoration.")
+    parser.add_argument("--slic-compactness", default=6.0, type=float, help="Compactness used by SLIC.")
+    parser.add_argument("--slic-sigma", default=0.0, type=float, help="Gaussian smoothing sigma used by SLIC.")
+    parser.add_argument("--slic-depth-scale", default=0.5, type=float, help="Relative depth-channel scale appended to Lab color before SLIC.")
     parser.add_argument("--slic-input-mode", default="rgbd", choices=["rgb", "depth", "rgbd"], help="Input modality used by SLIC: RGB only, depth only, or concatenated RGB-D.")
     parser.add_argument("--sigma-sem", default=0.20, type=float, help="Sigma used in semantic affinity exp(-(1-cos)/sigma_sem).")
     parser.add_argument("--sigma-dep", default=0.02, type=float, help="Sigma used in depth affinity exp(-(d_i-d_j)^2/sigma_dep).")
@@ -1466,7 +1467,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-edge", default=0.20, type=float, help="Sigma used in edge penalty exp(-max_edge/sigma_edge).")
     parser.add_argument("--min-affinity", default=1e-6, type=float, help="Clamp affinities below this value to zero.")
     parser.add_argument("--min-cluster-regions", default=2, type=int, help="Minimum number of superpixels kept on each side of a recursive split.")
-    parser.add_argument("--ncut-threshold", default=0.18, type=float, help="Maximum normalized-cut score accepted by a recursive split.")
+    parser.add_argument("--ncut-threshold", default=0.10, type=float, help="Maximum normalized-cut score accepted by a recursive split.")
     parser.add_argument("--max-recursion-depth", default=8, type=int, help="Maximum recursive NCut depth inside one GT connected component.")
     parser.add_argument("--extra-knn-neighbors", default=8, type=int, help="Extra non-adjacent spatial-nearest graph edges added per node beyond direct adjacency. Set 4 or 8, 0 disables.")
     return parser.parse_args()
