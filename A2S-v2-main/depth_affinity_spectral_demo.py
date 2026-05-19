@@ -621,33 +621,68 @@ def _resize_rgb_if_needed(rgb: Optional[np.ndarray], target_shape: Tuple[int, in
     return cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
 
+def _build_rgbd_slic_input(
+    depth: np.ndarray,
+    rgb: Optional[np.ndarray],
+    depth_scale: float,
+    input_mode: str = "rgbd",
+) -> Tuple[np.ndarray, str]:
+    depth = _normalize_gray(depth).astype(np.float32)
+    input_mode = str(input_mode).strip().lower()
+    if input_mode not in {"rgb", "depth", "rgbd"}:
+        input_mode = "rgbd"
+
+    if input_mode == "depth" or rgb is None:
+        return depth[..., None], "depth"
+
+    image_rgb = _resize_rgb_if_needed(rgb, depth.shape)
+    if image_rgb is None:
+        return depth[..., None], "depth"
+
+    lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB).astype(np.float32) / 255.0
+    if input_mode == "rgb":
+        return lab, "rgb"
+    return np.concatenate(
+        [lab, (float(depth_scale) * depth)[..., None].astype(np.float32)],
+        axis=2,
+    ), "rgbd"
+
+
 def _build_full_image_superpixels(
     depth: np.ndarray,
     rgb: Optional[np.ndarray],
     superpixel_count: int,
     slic_compactness: float,
     slic_sigma: float,
+    slic_depth_scale: float,
+    slic_input_mode: str = "rgbd",
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     n_segments = max(1, int(superpixel_count))
     debug_info: Dict[str, object] = {
         "requested_segments": int(n_segments),
-        "slic_input_mode": "rgb",
+        "slic_input_mode": "rgbd",
     }
     if n_segments <= 1:
         return np.ones_like(depth, dtype=np.int32), debug_info
 
-    image_rgb = _resize_rgb_if_needed(rgb, depth.shape)
-    if image_rgb is None:
-        depth_rgb = np.clip(_normalize_gray(depth) * 255.0, 0.0, 255.0).astype(np.uint8)
-        image_rgb = np.repeat(depth_rgb[..., None], 3, axis=2)
-        debug_info["slic_input_mode"] = "depth_fallback_rgb"
+    slic_input, actual_input_mode = _build_rgbd_slic_input(
+        depth=depth,
+        rgb=rgb,
+        depth_scale=slic_depth_scale,
+        input_mode=slic_input_mode,
+    )
+    debug_info["slic_input_mode"] = actual_input_mode
     try:
         labels = slic(
-            image_rgb,
+            slic_input,
             n_segments=int(n_segments),
             compactness=float(slic_compactness),
             sigma=float(slic_sigma),
-            start_label=0,
+            start_label=1,
+            convert2lab=False,
+            enforce_connectivity=True,
+            min_size_factor=0.4,
+            max_size_factor=3.0,
             channel_axis=-1,
         ).astype(np.int32)
     except Exception:
@@ -1195,6 +1230,8 @@ def split_depth_instances_affinity_spectral(
         superpixel_count=superpixel_count,
         slic_compactness=slic_compactness,
         slic_sigma=slic_sigma,
+        slic_depth_scale=slic_depth_scale,
+        slic_input_mode=slic_input_mode,
     )
     label_map = np.zeros_like(support, dtype=np.int32)
     superpixel_label_map = np.zeros_like(support, dtype=np.int32)
@@ -1426,8 +1463,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-superpixel-area", default=40, type=int, help="Minimum kept superpixel area before coverage restoration.")
     parser.add_argument("--slic-compactness", default=10.0, type=float, help="Compactness used by SLIC.")
     parser.add_argument("--slic-sigma", default=1.0, type=float, help="Gaussian smoothing sigma used by SLIC.")
-    parser.add_argument("--slic-depth-scale", default=0.5, type=float, help="Legacy compatibility option; RGB SLIC no longer uses depth channels.")
-    parser.add_argument("--slic-input-mode", default="rgb", choices=["rgb", "depth", "rgbd"], help="Legacy compatibility option; RGB SLIC is always used when RGB is available.")
+    parser.add_argument("--slic-depth-scale", default=0.5, type=float, help="Relative depth-channel scale appended to Lab color before RGB-D SLIC.")
+    parser.add_argument("--slic-input-mode", default="rgbd", choices=["rgb", "depth", "rgbd"], help="Input modality used by full-image SLIC before support-mask clipping.")
     parser.add_argument("--sigma-sem", default=0.20, type=float, help="Sigma used in semantic affinity exp(-(1-cos)/sigma_sem).")
     parser.add_argument("--sigma-dep", default=0.02, type=float, help="Sigma used in depth affinity exp(-(d_i-d_j)^2/sigma_dep).")
     parser.add_argument("--sigma-spatial", default=0.12, type=float, help="Sigma used in spatial affinity exp(-dist^2/sigma_spatial). Distances are normalized by the component diagonal.")

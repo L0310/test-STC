@@ -1468,6 +1468,8 @@ class SAMTrainHelper:
         if global_missing_ratio is None:
             global_missing_ratio = float(global_missing_mask.sum()) / float(max(1, int(prompt_mask.sum())))
         is_case_b = float(global_missing_ratio) >= self.refine_missing_ratio_thresh
+        if not is_case_b:
+            return refined_candidates, np.zeros((0, 2), dtype=np.float32), refine_fg_masks_by_point, refine_negative_points_by_point, case_records
 
         for source_candidate in source_candidates:
             source_id = id(source_candidate)
@@ -1476,14 +1478,11 @@ class SAMTrainHelper:
             seen_source_ids.add(source_id)
             if source_candidate.mask_orig is None:
                 continue
-            first_mask = _ensure_binary_mask(source_candidate.mask_orig)
-            if first_mask.shape != prompt_mask.shape:
-                first_mask = _resize_mask(first_mask, prompt_mask.shape)
             group_start, group_end = self._candidate_group_bounds(points_xy, point_group_starts, source_candidate.point_idx)
             if not (0 <= group_start < group_end <= len(points_xy)):
                 continue
 
-            refine_seed_mask = prompt_mask.copy() if is_case_b else first_mask
+            refine_seed_mask = prompt_mask.copy()
             refine_points_xy = points_xy[group_start:group_end].astype(np.float32)
             refine_point_idx = sum(group.shape[0] for group in refine_points_groups)
             refine_points_groups.append(refine_points_xy)
@@ -1509,7 +1508,7 @@ class SAMTrainHelper:
                     set_image=False,
                 )
             )
-            case_records.append((source_candidate, "b" if is_case_b else "a", float(global_missing_ratio)))
+            case_records.append((source_candidate, "b", float(global_missing_ratio)))
 
         if not refine_points_groups:
             return refined_candidates, np.zeros((0, 2), dtype=np.float32), refine_fg_masks_by_point, refine_negative_points_by_point, case_records
@@ -2774,9 +2773,20 @@ class SAMTrainHelper:
                 & (~_ensure_binary_mask(final_mask).astype(bool))
             ).astype(np.uint8)
             point_refine_missing_ratio = float(point_refine_missing_mask.sum()) / float(max(1, int(_ensure_binary_mask(prompt_mask).sum())))
-            if self.use_affinity_split and point_refine_sources and (save_point_refine or save_point_refine_neg):
-                self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb_aug)))
+            point_refine_is_case_b = point_refine_missing_ratio >= self.refine_missing_ratio_thresh
             if self.use_affinity_split and point_refine_sources and save_point_refine:
+                self._save_point_refine_cases(
+                    image_rgb,
+                    final_mask,
+                    points_xy,
+                    prompt_mask,
+                    point_refine_missing_ratio,
+                    sample_name,
+                    epoch,
+                )
+            if self.use_affinity_split and point_refine_is_case_b and point_refine_sources and (save_point_refine or save_point_refine_neg):
+                self.predictor.set_image(np.ascontiguousarray(_ensure_uint8_rgb(image_rgb_aug)))
+            if self.use_affinity_split and point_refine_is_case_b and point_refine_sources and save_point_refine:
                 (
                     point_refine_raw_candidates,
                     point_refine_points_xy,
@@ -2792,15 +2802,6 @@ class SAMTrainHelper:
                     global_missing_mask=point_refine_missing_mask,
                     global_missing_ratio=point_refine_missing_ratio,
                     use_negative=False,
-                )
-                self._save_point_refine_cases(
-                    image_rgb,
-                    final_mask,
-                    points_xy,
-                    prompt_mask,
-                    point_refine_missing_ratio,
-                    sample_name,
-                    epoch,
                 )
                 (
                     _,
@@ -2856,7 +2857,7 @@ class SAMTrainHelper:
                     pseudo_prefix="pseudo_labels_point_refine",
                     final_candidates_prefix="sam_point_refine_final_candidates",
                 )
-            if self.use_affinity_split and point_refine_sources and save_point_refine_neg:
+            if self.use_affinity_split and point_refine_is_case_b and point_refine_sources and save_point_refine_neg:
                 (
                     point_refine_neg_raw_candidates,
                     point_refine_neg_points_xy,
